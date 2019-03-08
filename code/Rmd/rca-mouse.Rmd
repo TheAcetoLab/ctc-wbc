@@ -1,0 +1,749 @@
+---
+title: "Determination of white blood cell type attached to circulating tumor cells in mice models using RNA-seq data"
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  output: html
+  root_dir: ../../
+  min.readCount: 5
+  min.samplesExpressed: 3
+output:
+  html_document:
+    number_sections: yes
+    theme: journal
+    highlight: pygments
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+  pdf_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: '4'
+---
+
+# Setup
+
+<!-- Setup Font for PDF -->
+\fontfamily{phv}
+\fontsize{8}{12}
+\selectfont
+\newpage
+
+<!-- Analysis directories and global chunk options -->
+```{r setup, include = FALSE}
+# Working directory
+knitr::opts_knit$set(root.dir = normalizePath(params$root_dir))
+setwd(params$root_dir)
+
+# Results directory
+dir.res <- 'results/rca'
+if(!file.exists(dir.res))
+  dir.create(dir.res, recursive = TRUE)
+
+
+# Global chunk options
+knitr::opts_chunk$set(fig.align='center', results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, include = TRUE)
+```
+
+<!-- General Libraries -->
+```{r libraries, include = FALSE}
+# Src CRAN
+library(tidyverse)
+library(gridExtra)
+library(circlize)
+library(cowplot)
+library(ggsci)
+library(RColorBrewer)
+library(pander)
+library(DT)
+library(WGCNA)
+
+# Src github
+library(RCA) # https://github.com/GIS-SP-Group/RCA
+
+# Src Bioconductor
+library(scater)
+library(scran)
+
+```
+
+<!-- Additional Functions -->
+```{r functions, include = FALSE}
+# Require the libraries : 
+# ComplexHeatmap,circlize, dendextend, RColorBrewer, plyr, wesanderson, scales
+source('./code/R-functions/clustering.r')
+
+# Heat Colors Generator
+heatCol.gen <- function(x, limits = NULL, center = FALSE, pal = 'YlGnBu', reverse.pal = FALSE) {
+  require(tmaptools)
+  use.limits <- range(x)
+  if(!is.null(limits)) {
+   use.limits <- limits
+  }
+  if(center) {
+    maxVal <- max(abs(range(x)))
+    use.limits <- c(-maxVal, maxVal)
+  }
+  pal.colors <- tmaptools::get_brewer_pal(pal, 20, plot = FALSE)
+  if(reverse.pal) {
+   pal.colors <- rev(pal.colors)
+  }
+  circlize::colorRamp2(
+   seq(use.limits[1], use.limits[2],length.out = 20),
+   pal.colors
+  )
+}
+
+# Add alpha to colors
+add.alpha <- function(x, alpha=1){
+  if(missing(x))
+    stop("Please provide a vector of colours.")
+  apply(sapply(x, col2rgb)/255, 2, 
+                     function(y) 
+                       rgb(y[1], y[2], y[3], alpha=alpha))  
+}
+
+```
+
+<!-- RCA : Additional Functions -->
+```{r rcaFunctions, include = FALSE}
+
+# Modified version of RCA::featureConstruct
+# project the expression data into Reference Component space using a built matrix of expression
+my.featureConstruct <- function(obj_in, signature = NULL, power = 4) 
+{
+  fpkm_temp = obj_in$fpkm_transformed
+  data = fpkm_temp
+  data11 = list()
+  if(exists('data12'))
+    rm(data12)
+  for (i in 1:length(signature)) {
+    data1 = signature[[i]]
+    d1 = as.dist(1 - cor(data1))
+    t1 = hclust(d1, method = "average")
+    temp = rownames(data)
+    temp1 = gsub("^.*?_", "", temp)
+    temp2 <- strsplit(temp1, "_ENS")
+    temp3 <- paste("", lapply(temp2, "[[", 1), sep = "")
+    temp4 = intersect(temp3, rownames(data1))
+    temp5 = temp[match(temp4, temp3)]
+    data2 = data1[temp4, ]
+    data4 = data[temp5, , drop = FALSE]
+    data3 = data2
+    data5 = cbind(data4, data3)
+    data6 = cor(data5, method = "pearson")
+    data6 = as.data.frame(data6)
+    data7 = data6[(dim(data)[2] + 1):dim(data6)[2], 
+      1:dim(data)[2]]
+    data8 = data7
+    data9 = abs(data8)^(power) * sign(data8)
+    data10 = scale(data9, center = TRUE, scale = TRUE)
+    data11[[i]] = data10
+    if(exists('data12')) {
+       data12 = cbind(data12, as.data.frame(t(data10)))
+    }
+    if(!exists('data12')) {
+      data12 = as.data.frame(t(data10))
+    }
+  }
+  data12 = as.data.frame(t(data12))
+  fpkm_for_clust = data12
+  obj_out = append(obj_in, list(fpkm_for_clust = fpkm_for_clust))
+  return(obj_out)
+}
+
+```
+
+<!-- PDF panderOptions for pandoc -->
+```{r panderOptions, include = FALSE}
+pander::panderOptions('table.alignment.default', 'right')
+pander::panderOptions('table.alignment.rownames', 'left')
+pander::panderOptions('table.split.table', Inf)
+pander::panderOptions('table.caption.prefix', 'Table : ')
+```
+
+
+
+
+
+
+# Load data
+
+<!-- Load featureCounts SCE-->
+```{r}
+sce <- readRDS('data/sce_mm.rds')
+```
+
+<!-- Additional SCE annotation -->
+```{r}
+colData(sce) <-
+  colData(sce) %>% data.frame %>% 
+  rownames_to_column(var = 'rownames') %>%
+  dplyr::mutate(
+    mouse_model = ifelse(grepl("NSG", sample, ignore.case = TRUE), "NSG", NA),
+    mouse_model = ifelse(grepl("NSG_4T1", sample, ignore.case = TRUE), "NSG-4T1", mouse_model),
+    mouse_model = ifelse(grepl("Br16", sample, ignore.case = TRUE), "NSG-BR16", mouse_model),
+    mouse_model = ifelse(grepl("LM2", sample, ignore.case = TRUE), "NSG-LM2", mouse_model),
+    mouse_model = ifelse(grepl("Balb_c", sample, ignore.case = TRUE), "Balb/c", mouse_model),
+    mouse_model = ifelse(grepl("Balb_c_4T1", sample, ignore.case = TRUE), "Balb/c-4T1", mouse_model),
+    mouse_model = ifelse(grepl("PyMT", sample, ignore.case = TRUE), "MMTV-PyMT", mouse_model),
+
+    mouse_model_group = ifelse(grepl("NSG", sample), "NSG", "non-NSG"),
+    
+    mouse_strain = ifelse(grepl("NSG", mouse_model), "NSG", NA),
+    mouse_strain = ifelse(grepl("Balb/c", mouse_model), "Balb/c", mouse_strain),
+    mouse_strain = ifelse(grepl("PyMT", mouse_model), "PyMT", mouse_strain)
+    
+  ) %>%
+  column_to_rownames(var = 'rownames') %>% DataFrame
+```
+
+<!-- Filter SCE-->
+```{r}
+# Select samples
+useSamples <-  colData(sce) %>% data.frame %>% 
+  dplyr::filter(
+    cell_type == "CTC-WBC" |
+    cell_type == "WBC" |
+    grepl("reference", comments)
+    ) %>% 
+  collect %>% .[['sample']]
+
+# Remove references WBC samples that in RCA don't cluster within their annotated cell type
+samples_outliers <- c('Br16_NSG_NK', 'Balb_c_Mono', 'PyMT_Mono')
+useSamples <- setdiff(useSamples, samples_outliers)
+
+# Filter sce
+endog_genes <- !rowData(sce)$is_feature_control
+useSce <- sce[endog_genes, useSamples]
+
+
+# Filter Genes
+keep_genes <- rowSums(counts(useSce) >= params$min.readCount) >= params$min.samplesExpressed
+rowData(useSce)$use <- keep_genes
+keep_genes_names <- names(keep_genes)[keep_genes]
+useSce <- useSce[rowData(useSce)$use,]
+
+```
+
+
+# Create expression matrix for mouse gene atlas
+
+* Create Global mouse panel signatures from gene atlas GNF1M and MOE430
+
+  * URL: http://biogps.org/downloads/
+  
+  * Following the example from : http://www.nature.com/ng/journal/vaop/ncurrent/full/ng.3818.html
+```{r createMmGlobalSignatures}
+mouse.GlobalPanel.signature.file <- "data/cell_atlas/Mouse.global.signature.rds"
+
+buildSignature <- FALSE
+if(!file.exists(mouse.GlobalPanel.signature.file)) {
+  mouse.GlobalPanel.normalized.file <- "data/cell_atlas/Mouse.global.normalized.rds"
+  buildSignature <- TRUE
+  res <- list()
+  resNorm <- list()
+}
+
+# Build signature for Mouse GNF1M Gene Atlas (GPL1073) 
+if(buildSignature) {
+
+  # Mouse GNF1M Gene Atlas (GPL1073)  ####
+  dir.data <- file.path('data/cell_atlas/Mouse_GNF1M_gene_atlas_GPL1073')
+  
+  # Get data
+  if(!file.exists(dir.data))
+    dir.create(dir.data, recursive = TRUE)
+  if(!file.exists(file.path(dir.data, 'GNF1M_geneatlas_20120817.zip')))
+    download.file('http://plugins.biogps.org/download/GNF1M_geneatlas_20120817.zip',
+                  destfile = file.path(dir.data, 'GNF1M_geneatlas_20120817.zip'),
+                  "wget")
+  
+  # Read Expression data
+  data.expr <- read_tsv(file.path(dir.data, 'GNF1M_geneatlas_20120817.zip')) %>%
+    dplyr::rename(ProbesetID = X1)
+  
+  
+  # Chip Annotation for Mouse GNF1M (GPL1073) was last updated on May 2007
+  # https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GPL1073
+  # Annotation downloaded from BioGPS : http://biogps.org/downloads/
+  if(!file.exists(file.path(dir.data, 'gnf1m-anntable.zip')))
+    download.file('http://plugins.biogps.org/download/gnf1m-anntable.zip',
+              file.path(dir.data, 'gnf1m-anntable.zip'),
+              "wget")
+  annot.gnf1m <- read_tsv(file.path(dir.data, 'gnf1m-anntable.zip')) %>% 
+    dplyr::mutate(rowNames = ProbesetID) %>% 
+    dplyr::select(ProbesetID, Symbol)
+  
+  # Annotate and process expression data
+  data.expr <- data.expr %>% 
+    left_join(annot.gnf1m, by = 'ProbesetID') %>% # annotate gnf1m probes
+    dplyr::filter(!is.na(Symbol)) %>% 
+    dplyr::select(-ProbesetID) %>% 
+    data.frame()
+  
+  # Deal with duplicated genes : collapse proves from the same gene using the probes with the maximum expression
+  data.expr.agg <- aggregate(. ~ Symbol, data = data.expr, max) %>% 
+    tibble::column_to_rownames('Symbol')
+
+  # Quantile normalization was applied separately to the Human U133A/GNF1H Gene Atlas and the Primary Cell Atlas. Feature genes were selected on the basis of sample-specific expression in either data set. For GNF1H data, a gene was included in the feature set if the log10 (fold change) of its expression in any sample relative to the median across all samples exceeded 1. The same procedure was used to define the feature gene set for the Primary Cell Atlas reference panel except that the threshold was changed from 1 to 1.1 to bring the number of feature genes in line with that for the GNF1H panel. A total of 4,717 genes were selected as features for GNF1H and 5,209 genes were selected for the Primary Cell Atlas.
+  
+  # Matrix creation following https://www.nature.com/ng/journal/v49/n5/full/ng.3818.html#methods
+  data.expr.norm <- limma::normalizeBetweenArrays(data.expr.agg, "quantile")
+  data.fc <- t(apply(data.expr.norm, 1, function(x) x / median(x, na.rm = TRUE)))
+  data.fc.thr <- log10(data.fc) > 1.5
+  probe.sel <- rownames(data.fc.thr)[rowSums(data.fc.thr, na.rm = T) > 0]
+  data.expr.sel <- log10(data.expr.norm[probe.sel,])
+  
+  res[['Mouse_GNF1M']] <- data.expr.sel
+  resNorm[['Mouse_GNF1M']] <- data.expr.norm
+  data.expr.sel %>% 
+    as.data.frame() %>% 
+    write_tsv(path= file.path(dir.data, "Mouse_GNF1H.signature.txt"))
+  
+  data.expr.norm %>% 
+    as.data.frame() %>% 
+    write_tsv(path= file.path(dir.data, "Mouse_GNF1H.normalized.txt"))
+}
+
+
+
+# Build signature for Mouse MOE430 Gene Atlas (GSE10246)
+if(buildSignature) {
+  # Mouse MOE430 Gene Atlas
+  dir.data <- file.path('data/cell_atlas/Mouse_MOE430_GSE10246')
+  
+  # Get data
+  if(!file.exists(dir.data))
+    dir.create(dir.data, recursive = TRUE)
+  if(!file.exists(file.path(dir.data, 'geneatlas_MOE430_20090327.raw.avg.csv.zip')))
+    download.file('http://plugins.biogps.org/download/geneatlas_MOE430_20090327.raw.avg.csv.zip',
+                  destfile = file.path(dir.data, 'geneatlas_MOE430_20090327.raw.avg.csv.zip'),
+                  "wget")
+  
+  # Read Expression data
+  data.expr <- read_csv(file.path(dir.data, 'geneatlas_MOE430_20090327.raw.avg.csv.zip')) %>%
+    dplyr::rename(ProbesetID = X1)
+  
+  
+  # Chip Annotation for MOE430 (GPL1261) is maintaned by Affymetrx
+  # https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GPL1261
+  # http://www.affymetrix.com/support/technical/byproduct.affx?product=moe430-20
+  if(!file.exists(file.path(dir.data, 'moe430-anntable.rds'))){
+    # library(biomaRt)
+    ensembl <- biomaRt::useMart("ensembl",dataset="mmusculus_gene_ensembl")
+    affyids <- data.expr$ProbesetID
+    annot.moe430 <- biomaRt::getBM(attributes=c('affy_moe430a', 'affy_moe430b', 'ensembl_gene_id', 'entrezgene', 'hgnc_symbol', 'description', 'external_gene_name', 'mgi_symbol'), 
+                         filters = 'affy_moe430a', 
+                         values = affyids, 
+                         mart = ensembl)
+    
+    
+    saveRDS(annot.moe430, file = file.path(dir.data, 'moe430-anntable.rds'))
+  }
+  annot.moe430 <- readRDS(file.path(dir.data, 'moe430-anntable.rds')) %>% 
+    dplyr::rename(ProbesetID = affy_moe430a,
+                  Symbol = mgi_symbol) %>% 
+    dplyr::mutate(Symbol = ifelse(Symbol == "", NA, Symbol)) %>% 
+    dplyr::select(ProbesetID, Symbol)
+  
+  # Annotate and process expression data
+  data.expr <- data.expr %>% 
+    left_join(annot.moe430, by = 'ProbesetID') %>% # annotate gnf1h probes
+    dplyr::filter(!is.na(Symbol)) %>% 
+    dplyr::select(-ProbesetID) %>% 
+    data.frame()
+  
+  # Deal with duplicated genes : collapse proves from the same gene using the probes with the maximum expression
+  data.expr.agg <- aggregate(. ~ Symbol, data = data.expr, max) %>% 
+    tibble::column_to_rownames('Symbol')
+  
+
+  # Quantile normalization was applied separately to the Human U133A/GNF1H Gene Atlas and the Primary Cell Atlas. Feature genes were selected on the basis of sample-specific expression in either data set. For GNF1H data, a gene was included in the feature set if the log10 (fold change) of its expression in any sample relative to the median across all samples exceeded 1. The same procedure was used to define the feature gene set for the Primary Cell Atlas reference panel except that the threshold was changed from 1 to 1.1 to bring the number of feature genes in line with that for the GNF1H panel. A total of 4,717 genes were selected as features for GNF1H and 5,209 genes were selected for the Primary Cell Atlas.
+  
+  # Matrix creation following https://www.nature.com/ng/journal/v49/n5/full/ng.3818.html#methods
+  data.expr.norm <- limma::normalizeBetweenArrays(data.expr.agg, "quantile")
+  data.fc <- t(apply(data.expr.norm, 1, function(x) x / median(x, na.rm = TRUE)))
+  data.fc.thr <- log10(data.fc) > 1.5
+  probe.sel <- rownames(data.fc.thr)[rowSums(data.fc.thr, na.rm = T) > 0]
+  data.expr.sel <- log10(data.expr.norm[probe.sel,])
+  
+  res[['Mouse_MOE430']] <- data.expr.sel
+  resNorm[['Mouse_MOE430']] <- data.expr.norm
+  data.expr.sel %>% 
+    as.data.frame() %>% 
+    write_tsv(path= file.path(dir.data, "Mouse_MOE430.signature.txt"))
+  
+  data.expr.norm %>% 
+    as.data.frame() %>% 
+    write_tsv(path= file.path(dir.data, "Mouse_MOE430.normalized.txt")) 
+}
+
+# Save rds
+if(buildSignature) {
+  saveRDS(res, file = mouse.GlobalPanel.signature.file) 
+  saveRDS(resNorm, file = mouse.GlobalPanel.normalized.file) 
+}
+```
+
+
+# Identification of marker genes between immune reference populations
+
+Count data are analyzed to detect genes that drive heterogeneity across the reference population of cells. To define the reference population cells, we removed the cells annotated as WBC (either alone or attached to a CTC) and <span style=\"color:red\">platelets</span>. Since our samples under study could contain platelets, they were sequenced as a part of the reference population to exclude platelet-derived gene expression observed in the WBC samples. However, using platelets as a reference to define marker genes could lead to WBC clustering with platelets, masking the correlation of WBC with the rest of referenece samples
+
+**Identification of highly variable genes (HVGs) that drive heterogeneity across the population of cells**. This requires estimation of the variance in expression for each gene, followed by decomposition of the variance into biological and technical components. HVGs are then identified as those genes with the largest biological components. This avoids prioritizing genes that are highly variable due to technical factors such as sampling noise during RNA capture and library preparation. An additional method (not considered at the moment) is to identify modules of genes that are highly correlated. This distinguishes between HVGs caused by random noise and those involved in driving systematic differences between subpopulations. Correlations between genes are quantified by computing Spearman's rho using only the HVG identified in the previous step
+
+
+```{r}
+thrs.fdr <- 0.05
+thrs.bio <- 0.5
+
+# reference  samples
+refSamples <- colData(useSce)$is.ref & colData(useSce)$cell_type != 'Platelets'
+
+
+# Detecting HVG
+var.fit.ref <- trendVar(useSce[,refSamples], method="loess", use.spikes=FALSE, span=0.2)
+var.out.ref <- decomposeVar(useSce[,refSamples], var.fit.ref)
+var.out.ref <- var.out.ref[order(var.out.ref$bio, decreasing = TRUE), ]
+var.out <- var.out.ref
+
+# significant HVG genes
+hvg.out <- var.out[which(var.out$FDR <= thrs.fdr & var.out$bio >= thrs.bio),]
+hvg.out <- hvg.out[order(hvg.out$bio, decreasing=TRUE),]
+hvg.genes <- intersect(rownames(useSce), rownames(hvg.out))
+```
+
+
+# Quality control
+
+## Expression of CD45
+
+```{r, fig.height=5, fig.width=7}
+sce.chunk <- useSce
+gene <- c('Ptprc')
+
+# Get expression values
+mat <- exprs(sce.chunk)[gene,, drop = FALSE]
+mat <- data.frame(t(mat))
+
+# Add annotation to mat
+annot <- colData(sce.chunk)[rownames(mat), c("sample_cell_cat", "cell_type", "n_ctc", "n_wbc_attached", "mouse_model", "mouse_model_group", "mouse_strain")]
+
+mat <- cbind(mat, annot) %>% data.frame %>% 
+  tibble::rownames_to_column(var='samples') %>%
+  gather(-sample_cell_cat, -cell_type, -samples, -samples, -n_ctc, -n_wbc_attached, -mouse_model, -mouse_model_group, -mouse_strain,
+         key = "gene", value = "expression")
+
+
+CTC.wbc.cd45null <- mat %>%
+  dplyr::filter(sample_cell_cat == "CTC.wbc" &
+                  expression < 5) %>% 
+  collect %>% 
+  .[["samples"]]
+
+
+wbc.cd45null <- mat %>%
+  dplyr::filter(expression < 5) %>% 
+  collect %>% 
+  .[["samples"]]
+
+cat("\n\n")
+
+```
+
+
+
+# RCA clusters
+
+Reference Component Analysis (RCA) is an algorithm for robustly cluster single-cell transcriptomes [Li et al. (2017)](https://www.nature.com/ng/journal/v49/n5/full/ng.3818.html). As global panel from bulk transcriptomes is used as reference using GNF1M Gene Atlas and MOE430 Gene Atlas (see [BioGPS](http://biogps.org/downloads/)
+
+
+* Names in the reference panel have been curated
+* The reference panel contains more than 1 samples for several cell types. To simply the figure, I removed the duplicated cell types by choosing the sample with the highest correlation with the unknown WBC samples
+* NK reference sample Br16_NSG_NK removed as it doesn't cluster with others NK
+* Monocyte reference samples Balb_c_Mono and PyMT_Mono removed. They cluster separately from the other monocytes, although they have a high score for Myeloid Dendritic Cells
+
+
+
+## Select samples
+
+  * remove CTC-WBC samples with zero expression of PTPRC (CD45)
+
+  * remove platelets from the reference sample panel
+
+```{r}
+# Sample selection
+rmSamples <-  c('REF.Platelets')
+useSamples <- rownames(colData(useSce))
+if(!is.null(rmSamples))
+ useSamples <- rownames(colData(useSce))[!colData(useSce)$sample_cell_cat %in% rmSamples]
+
+# Remove CTC+WBC samples with null CD45 expression
+useSamples <- setdiff(useSamples, wbc.cd45null)
+```
+
+
+## Prepare RCA data
+```{r}
+# Sample selection from defined annotation
+fpkm_data <- fpkm(useSce)[, useSamples]
+# Modify gene names
+rownames(fpkm_data) <- paste0("XXXX_", rownames(fpkm_data), "_ENSYYYY")
+# construct data object
+data_obj <-  dataConstruct(fpkm_data)
+# filt out lowly expressed genes
+data_obj <- geneFilt(obj_in = data_obj)
+# normalize gene expression data (Note: default is no normalization). 
+data_obj <- cellNormalize(data_obj, 'no_norm')
+# log transform the data
+data_obj <- dataTransform(data_obj, "log10")
+
+data_obj_use <- data_obj
+
+# Gene Selection
+useGenes <- rowData(useSce)$Geneid[rowData(useSce)$Geneid %in% hvg.genes]
+useGenes <- paste0("XXXX_", useGenes, "_ENSYYYY")
+useGenes <- useGenes[useGenes %in% rownames(data_obj_use$fpkm_transformed)]
+data_obj_use$fpkm_transformed <- data_obj_use$fpkm_transformed[useGenes, ]
+```
+
+## Run RCA
+```{r}
+# load expression atlas
+panel.signature <- readRDS("data/cell_atlas/Mouse.global.signature.rds")
+# remove X at the beggining of the name : put automatically by normalization (low coverage??)
+colnames(data_obj_use$fpkm_transformed) <- colnames(data_obj_use$fpkm)
+# project the expression data into Reference Component space
+data_obj_use <- my.featureConstruct(data_obj_use, signature = panel.signature)
+# clean data : filter cell types with low correlation
+keep_cell_types <- apply(data_obj_use$fpkm_for_clust, 1, function(x) sum(abs(x) > 2, na.rm = TRUE) >=1 )
+data_obj_use$fpkm_for_clust <- data_obj_use$fpkm_for_clust[keep_cell_types,]
+# clean data : clean sample with no correlations
+useSamples <- !colSums(is.na(data_obj_use$fpkm_for_clust)) == nrow(data_obj_use$fpkm_for_clust)
+data_obj_use$fpkm_for_clust <- data_obj_use$fpkm_for_clust[,useSamples]
+# generate cell clusters
+data_obj_use <- cellClust(data_obj_use)
+
+
+```
+
+
+## Clean reference panel names
+```{r}
+useRow <- rownames(data_obj_use$fpkm_for_clust)
+  
+newRefAnnot <- data.frame(useRow, 
+           corrSum=rowSums(data_obj_use$fpkm_for_clust)) %>% 
+  dplyr::mutate(ord = dplyr::desc(corrSum)) %>% 
+  dplyr::arrange(ord) %>% 
+  dplyr::mutate(cat = useRow,
+                cat = gsub("_", " ", cat),
+                cat = gsub("\\.+", " ", cat),
+                cat = gsub("(^[[:alpha:]])", "\\U\\1", cat, perl=TRUE),
+                cat = gsub("(Cd[0-9]+) (.+)", "\\2 \\1", cat, ignore.case = T),
+                cat = gsub("tcell", "T Cell", cat, ignore.case = T),
+                cat = gsub("bcell", "B Cell", cat, ignore.case = T),
+                cat = gsub("cell", "Cell", cat),
+                cat = gsub("Cells", "Cell", cat),
+                cat = gsub(" *positive", "+", cat),
+                cat = gsub(" *negative", "-", cat),
+                cat = gsub("Cd([0-9]+)", "CD\\1", cat),
+                cat = gsub("Follicular B Cell", "B Cell follicular", cat),
+                cat = gsub("B220 B Cell", "B Cell B220", cat),
+                cat = gsub(" $", "", cat),
+                cat = gsub("T Cell 1 CD4", "T Cell CD4 1", cat),
+                cat = gsub("T Cell 1 CD8", "T Cell CD8 1", cat),
+                catUnique = gsub(" [0-9]+$", "", cat),
+                cat = ifelse(duplicated(cat), paste0(cat, '.dup'), cat)
+                ) %>% 
+  tibble::column_to_rownames(var = 'useRow')
+
+data_obj_use$fpkm_for_clust <- data_obj_use$fpkm_for_clust[rownames(newRefAnnot),]
+rownames(data_obj_use$fpkm_for_clust) <- newRefAnnot$cat
+  
+
+```
+
+
+## Remove duplicated references from the panel
+
+Some cell types for references are duplicated. For example 'L82 T Cell CD8' == 'L78 T Cell CD8'. For duplicated cell types, select the ones with the highest correlation in case samples
+
+```{r}
+useSamples <- colnames(data_obj_use$fpkm)
+case.samples <- ! colData(useSce) %>% data.frame %>% 
+    dplyr::filter(sample %in% useSamples) %>% 
+    collect %>% .[["is.ref"]]
+newRefAnnot$corrSum <- rowSums(data_obj_use$fpkm_for_clust[,case.samples])
+newRefAnnot <- newRefAnnot[order(newRefAnnot$corrSum, decreasing = T),]
+keepUnique <- !duplicated(newRefAnnot$catUnique)
+newRefAnnot <- newRefAnnot[keepUnique, ]
+data_obj_use$fpkm_for_clust <- data_obj_use$fpkm_for_clust[newRefAnnot$cat,]
+rownames(data_obj_use$fpkm_for_clust) <- newRefAnnot$catUnique
+
+```
+
+## Remove non immune references
+```{r}
+immune.patterns <- c('dendritic', 'granulocytes', 'marrow', 'monocyte', 'b cell', 't cell', 
+                      'myeloid', 'nk', 'leukemia', 'lymph', 'cd34', 'erythroid', 
+                      'myelocyte', 'macrophage', 'neutrophil', 'erythroblast', 'lymphoblasts',
+                      'mast cell')
+use.ref.names <- rownames(data_obj_use$fpkm_for_clust)
+keep.ref.names <- grepl(
+  paste(immune.patterns, collapse="|"), 
+  use.ref.names, 
+  ignore.case = TRUE)
+cat("The following reference samples have been removed from the final list because they were not considered immune cell types:\n\n")
+cat(paste(paste("* ", use.ref.names[!keep.ref.names], " "), collapse = "\n\n"), "\n\n")
+cat("\n\n")
+  
+data_obj_use$fpkm_for_clust <- data_obj_use$fpkm_for_clust[keep.ref.names,]
+
+```
+
+
+
+# Figures
+## Extended Data Fig.2e : RCA clustering and heatmap
+
+Reference component analysis clustering of CTC-associated WBCs (red) and reference WBCs from mouse models, displaying projection scores of cells (columns, n = 47) on the immune reference panel (rows)
+
+```{r, fig.height=13, fig.width=15}
+# Define annotation and colors for the heatmap
+annot <- colData(useSce) %>%  data.frame %>% 
+  dplyr::select(sample_cell_cat) %>%
+  tibble::rownames_to_column(var = "rownames") %>%
+  dplyr::filter(rownames %in% colnames(data_obj_use$fpkm_for_clust)) %>%
+  dplyr::mutate(
+    sample_cell_cat = plyr::revalue(sample_cell_cat, c(
+                              "CTC.wbc" = "CTC-cluster-derived WBC",
+                              "REF.NKcells" = "REF. NK cells",
+                              "REF.Tcells" = "REF. T cells",
+                              "REF.Bcells" = "REF. B cells",
+                              "REF.Monocytes" = "REF. Monocyte",
+                              "REF.Granulocytes" = "REF. Granulocyte")
+                              ) %>% 
+      droplevels
+    ) %>% 
+  dplyr::arrange(sample_cell_cat) %>%
+  dplyr::rename(Category = sample_cell_cat) %>% 
+  tibble::column_to_rownames(var = "rownames")
+
+# Palette colors for samples/columns annotation
+color2WBC <- '#EC352F' # color picked  for WBC 
+pal <- pal_npg("nrc", alpha = 0.8)(9)[c(2,3,4,6)]
+palette_sampleCat <- c(color2WBC, 
+                      colorRampPalette(pal)(nlevels(annot$Category)-1)
+                      )
+
+# Define clusters
+clusterGroups <- factor(data_obj_use$group_labels_color[colnames(data_obj_use$fpkm_for_clust), "groupLabel"])
+names(clusterGroups) <- colnames(data_obj_use$fpkm_for_clust)
+
+
+# Palete list 
+paletteList  <- list(sampleCat = add.alpha(palette_sampleCat, .8))
+
+# Create heatmap with correlations
+use.heatCol <- heatCol.gen(data_obj_use$fpkm_for_clust, 
+                           center = TRUE, 
+                           pal = 'RdBu', 
+                           reverse.pal = TRUE)
+
+useAnno <- annot[colnames(data_obj_use$fpkm_for_clust),,drop=FALSE]
+
+annotation_legend_param = list(chr = list(nrow = 2, title = "chr", title_position = "leftcenter"))
+
+hp <- createHeatMap(
+  data_obj_use$fpkm_for_clust, 
+  annot = useAnno, 
+  usePaletteList = paletteList,
+  show_row_names = T,
+  show_column_names = F,
+  colCluster = T,
+  rowCluster = T,
+  show_row_dend = F,
+  show_column_dend = F,
+  multipalette = F,
+  resCluster = F,
+  column_names_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 16),
+  row_names_max_width = unit(9, "cm"),
+  top_annotation_height = unit(1.5, "cm"), 
+  column_dend_gp = gpar(lty = 2), 
+  range = range(data_obj_use$fpkm_for_clust),
+  dendC = data_obj_use$cellTree,
+  heatCol = use.heatCol,
+  heatmap_legend_param = list(color_bar = "continuous",
+                              labels_gp = gpar(fontsize = 20),
+                              legend_direction = "horizontal",
+                              grid_height = unit(10, "mm"), 
+                              legend_width = unit(80, "mm"),
+                              title_position = "topcenter",
+                              title_gp = gpar(fontsize = 20, fontface = 'bold')),
+  annotation_legend_param = list(
+    Category = list( 
+    labels_gp = gpar(fontsize = 20, fontface = 'bold'),
+    grid_height = unit(8, "mm"),
+    grid_width = unit(8, "mm"),
+    title = "",
+    nrow = 3)),
+  name = "(Projection score)"
+)
+
+
+# Output
+draw(hp, heatmap_legend_side = "bottom", annotation_legend_side = "top")
+cat("\n\n")
+
+
+
+  
+```
+
+
+## Extended Data Fig.2d : PCA
+
+PCA of CTC-associated WBCs from all mouse models and five reference WBC populations (n = 47)
+
+```{r, fig.height=13, fig.width=15}
+pr <- prcomp(t(scale(data_obj_use$fpkm_for_clust)))
+
+pct_variance <- round(100*(pr$sdev ^ 2) / sum(pr$sdev^2) , 1)
+pc_projection <- as.data.frame(pr$x)
+pc_projection <- cbind(pc_projection, useAnno[rownames(pr$x),,drop = FALSE]) %>% 
+  dplyr::mutate(is.ref = ifelse(grepl('REF', Category), 'reference WBC', 'CTC-cluster-derived WBC'))
+
+use.colors <- add.alpha(palette_sampleCat, 0.5)
+names(use.colors) <- NULL
+
+pca_plot <- ggplot(pc_projection, aes(x = PC1, y = PC2, color = Category, shape = is.ref)) +
+  geom_point(size = 10) +
+  scale_color_manual(values=use.colors) +
+  labs(x = 'PC1',
+       y = 'PC2') +
+  theme(axis.text.x = element_text(size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title = element_text(size = 24),
+        legend.text = element_text(size = 18),
+        legend.position="top") + 
+  guides(col = guide_legend(ncol = 3, byrow = TRUE, title = NULL),
+         shape = guide_legend(ncol = 1, title = NULL))
+
+print(pca_plot)
+cat("\n\n")
+
+```
+
+
+
+
+# Save results for other analyses
+```{r}
+rca <- list()
+rca$data <- data_obj_use
+rca$cellClust <- clusterGroups
+saveRDS(rca, file = file.path(dir.res, "rca_mmu.rds"))
+```
+

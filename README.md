@@ -3,8 +3,6 @@
 ## Overview
 This repository contains the scripts and necessary metadata for the data analysis and figures appearing in the paper **Neutrophils escort circulating tumour cells to enable cell cycle progression** by [Szczerba BM et al. (2019)](https://www.nature.com/articles/s41586-019-0915-y). The analysis scripts are in R Markdown format and they relay in a `SingleCellExperiment` objects that have been deposited on Gene Expression Omnibus under the accession number [GSE109761](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE109761).
 
-We are currently working to adapt our scripts to facilitate the automatic rendering of the reports. Meanwhile, a preliminary version of the scripts that doesn't allow the rendering is available.
-
 
 ## Obtaining the data
 The code below shows how to download the data and prepare the files in order to run the project scripts.

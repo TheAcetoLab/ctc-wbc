@@ -1,0 +1,1016 @@
+---
+title: "Expression of cell-adhesion molecules (CAMs)-receptor pairs on CTC-neutrophil clusters"
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  output: pdf
+  root_dir: ../../
+  res_dir: results/cam_analysis_files
+output:
+  html_document:
+    number_sections: yes
+    theme: yeti
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+  pdf_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: '4'
+---
+
+# Summary
+
+This report shows the co-expression analyses between cell adhesion molecules (CAMs) and its receptors in CTC-WBC clusters. The CAM gene sets were obtained from KEGG pathway named [Cell adhesion molecules](http://www.genome.jp/kegg-bin/show_pathway?hsa04514).
+
+  
+# Setup
+
+<!-- Setup Font for PDF -->
+\fontfamily{phv}
+\fontsize{9}{10}
+\selectfont
+\newpage
+
+
+<!-- Analysis directories and global chunk options-->
+```{r setup, include = FALSE}
+
+# knitr options
+options(knitr.duplicate.label = 'allow')
+
+
+# Working directory
+knitr::opts_knit$set(root.dir = normalizePath(params$root_dir))
+setwd(params$root_dir)
+
+# Other directories
+if(!file.exists(params$res_dir))
+  dir.create(params$res_dir, recursive = TRUE)
+if(!file.exists('data/kegg'))
+  dir.create('data/kegg', recursive = TRUE)
+
+# Global chunk options
+knitr::opts_chunk$set(fig.align='center', results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, include = TRUE)
+
+```
+
+<!-- General Libraries -->
+```{r libraries, include=FALSE}
+# Src CRAN
+library(tidyverse)
+library(gridExtra)
+library(grid)
+library(circlize)
+library(cowplot)
+library(ggrepel)
+library(ggsci)
+library(wesanderson)
+library(RColorBrewer)
+library(pander)
+library(DT)
+library(parallel)
+library(ComplexHeatmap)
+
+# Src Bioconductor
+library(scater)
+
+```
+
+<!-- PDF panderOptions for pandoc -->
+```{r panderOptions, include=FALSE}
+
+pander::panderOptions('table.alignment.default', 'right')
+pander::panderOptions('table.alignment.rownames', 'left')
+pander::panderOptions('table.split.table', Inf)
+pander::panderOptions('table.caption.prefix', 'Table : ')
+
+```
+
+# Load data
+<!-- Load featureCounts SCE -->
+```{r}
+
+sce.hs <- readRDS('data/sce_hs.rds')
+colData(sce.hs) <- colData(sce.hs) %>% data.frame %>% 
+  rownames_to_column('rnames') %>% 
+  dplyr::mutate(
+    donor = gsub("_.*", "", sample)
+  ) %>% 
+  column_to_rownames('rnames') %>% 
+  DataFrame
+
+sce.mm <- readRDS('data/sce_mm.rds')
+colData(sce.mm) <- colData(sce.mm) %>% data.frame %>% 
+  rownames_to_column('rnames') %>% 
+  dplyr::mutate(
+    donor = gsub("_.*", "", sample)
+  ) %>% 
+  column_to_rownames('rnames') %>% 
+  DataFrame
+
+```
+
+<!-- Annotate Human SCE with RCA clusters -->
+```{r}
+sce <- sce.hs
+
+# Get cluster ID from data
+sce.clusterID <- colData(sce) %>% data.frame %>% 
+  dplyr::mutate(clusterID = ifelse(clusterID == 'NA', NA, clusterID)) %>%
+  collect %>% .[['clusterID']] %>% na.omit
+
+# Get WBC-cluster from rca analysis
+rca <- readRDS('results/rca/rca_hsa.rds')
+rca.cellClust <- rca$cellClust
+
+# Obtain CTC-cluster ID for rca analysis
+rca.cID <- colData(sce)[names(rca.cellClust),] %>% data.frame %>% 
+  dplyr::mutate(clusterID = ifelse(clusterID == 'NA', NA, clusterID)) %>%
+  collect %>% .[['clusterID']]
+rca.cellClust.Id <- rca.cellClust[!is.na(rca.cID)] # Subst only values with an assigned CTC-cluster ID
+names(rca.cellClust.Id) <- na.omit(rca.cID)
+rca.cellClust.Id <- cbind(clusterID = names(rca.cellClust.Id), rca.cluster.cID = as.character(rca.cellClust.Id)) %>%
+  data.frame(stringsAsFactors = F) %>% 
+  unique()
+
+# Collapse cluster ID for duplicated names
+use.df <- rca.cellClust.Id
+use.df.res <- sapply(rca.cellClust.Id$clusterID %>% unique, function(id) {
+  x.id <- use.df %>% dplyr::filter(clusterID == id)
+  c.n <- x.id$rca.cluster.cID %>% unique %>% sort %>% paste(., collapse = ",")
+  return(c(id, c.n))
+  }) %>% 
+  t() %>% 
+  data.frame(stringsAsFactors = F) %>% 
+  dplyr::rename(clusterID = X1, rca.cluster.cID = X2)
+rca.cellClust.Id <- use.df.res
+
+# Add to pheno data using CTC-cluster ID
+p.useSce <- colData(sce) %>% data.frame %>% 
+  rownames_to_column('keeprow') %>%
+  left_join(rca.cellClust.Id, by = 'clusterID') %>%
+  dplyr::mutate(rca.cluster = "No-eval") %>% 
+  dplyr::mutate(rca.cluster = ifelse(rca.cluster=="No-eval" & !is.na(rca.cluster.cID), rca.cluster.cID, rca.cluster)) %>%
+  dplyr::select(-rca.cluster.cID) %>%
+  column_to_rownames('keeprow')
+
+# add RCA using the sample name (original samples from RCA, some of them doesn't have an assigned CTC-cluster ID)
+rca.cellClust <- rca.cellClust[names(rca.cellClust) %in% rownames(colData(sce))]
+
+p.useSce[names(rca.cellClust), 'rca.cluster'] <- as.character(rca.cellClust[names(rca.cellClust)])
+
+colData(sce) <- p.useSce %>% DataFrame
+
+sce.hs <-sce
+```
+
+<!-- Annotate Mouse SCE with RCA clusters -->
+```{r}
+sce <- sce.mm
+
+# Get cluster ID from data
+sce.clusterID <- colData(sce) %>% data.frame %>% 
+  dplyr::mutate(clusterID = ifelse(clusterID == 'NA', NA, clusterID)) %>%
+  collect %>% .[['clusterID']] %>% na.omit
+
+# Get WBC-cluster from rca analysis
+rca <- readRDS('results/rca/rca_mmu.rds')
+rca.cellClust <- rca$cellClust
+
+# Obtain CTC-cluster ID for rca analysis
+rca.cID <- colData(sce)[names(rca.cellClust),] %>%  data.frame %>% 
+  dplyr::mutate(clusterID = ifelse(clusterID == 'NA', NA, clusterID)) %>%
+  collect %>% .[['clusterID']]
+rca.cellClust.Id <- rca.cellClust[!is.na(rca.cID)] # Subst only values with an assigned CTC-cluster ID
+names(rca.cellClust.Id) <- na.omit(rca.cID)
+rca.cellClust.Id <- cbind(clusterID = names(rca.cellClust.Id), rca.cluster.cID = as.character(rca.cellClust.Id)) %>%
+  data.frame(stringsAsFactors = F) %>% 
+  unique()
+
+# Collapse cluster ID for duplicated names
+use.df <- rca.cellClust.Id
+use.df.res <-sapply(rca.cellClust.Id$clusterID %>% unique, function(id) {
+  x.id <- use.df %>% dplyr::filter(clusterID == id)
+  c.n <- x.id$rca.cluster.cID %>% unique %>% sort %>% paste(., collapse = ",")
+  return(c(id, c.n))
+  }) %>% 
+  t() %>% 
+  data.frame(stringsAsFactors = F) %>% 
+  dplyr::rename(clusterID = X1, rca.cluster.cID = X2)
+rca.cellClust.Id <- use.df.res
+
+# Add to pheno data using CTC-cluster ID
+p.useSce <- colData(sce) %>% data.frame %>% 
+  rownames_to_column('keeprow') %>%
+  left_join(rca.cellClust.Id, by = 'clusterID') %>%
+  dplyr::mutate(rca.cluster = "No-eval") %>% 
+  dplyr::mutate(rca.cluster = ifelse(rca.cluster=="No-eval" & !is.na(rca.cluster.cID), rca.cluster.cID, rca.cluster)) %>%
+  dplyr::select(-rca.cluster.cID) %>%
+  column_to_rownames('keeprow')
+
+p.useSce[names(rca.cellClust), 'rca.cluster'] <- as.character(rca.cellClust[names(rca.cellClust)])
+
+
+colData(sce) <- p.useSce %>% DataFrame
+
+sce.mm <- sce
+
+```
+
+
+# CAM gene sets
+* KEGG : Cell adhesion molecules
+  + Human : http://www.genome.jp/kegg-bin/show_pathway?org_name=hsa&mapno=04514&mapscale=0.67&show_description=hide
+  + Mouse : http://www.genome.jp/kegg-bin/show_pathway?org_name=mmu&mapno=04514&mapscale=0.67&show_description=show
+
+<!-- Create data from KEGG : CAMS -->
+```{r}
+
+# KEGG : CAM-cam receptor interaction
+# Human : http://www.genome.jp/kegg-bin/show_pathway?org_name=hsa&mapno=04514&mapscale=0.67&show_description=hide
+# Mouse : http://www.genome.jp/kegg-bin/show_pathway?org_name=mmu&mapno=04514&mapscale=0.67&show_description=show
+# I will use KEGGgraph (http://bioconductor.org/packages/release/bioc/html/KEGGgraph.html) to extract gene id and interactions 
+# Pathways are stored and presented as graphs on the KEGG server side, where nodes are
+# molecules (protein, compound, etc) and edges represent relation types between the nodes,
+# e.g. activation or phosphorylation. 
+# KEGGgraph requires the  KGML (KEGG XML) files that show the list of genes (nodes) and their interaction (edges)
+kegg.data <- './data/kegg'
+
+# HUMAN ---------------------------------------------------
+res.file <- file.path(kegg.data, 'hsa04514.tsv.txt')
+
+if(!file.exists(res.file)){
+  library(KEGGgraph)
+  library(KEGGREST)
+  
+  # 1. Get KGML file
+  kgml.file <- file.path(kegg.data, 'hsa04514.kgml')
+  mapkKGML <- retrieveKGML('hsa04514', organism="hsa", destfile=kgml.file, method="wget", quiet=TRUE)
+  
+  # 2. Parse to a graph
+  mapkG <- parseKGML2Graph(mapkKGML, expandGenes=TRUE)
+  mapkP <- parseKGML(mapkKGML)
+  
+  # 3. Convert nodes to gene names
+  cl <- makeCluster(6, type="FORK")
+  kegg.query <- parSapply(cl, nodes(mapkG), keggGet)
+  stopCluster(cl)
+  
+  # 4. Extact gene names from the keeg query
+  kegg.query.NAME <- lapply(kegg.query, function(x){
+    if(!is.null(x$NAME))
+      strsplit(x$NAME, ", ") %>% unlist() %>% .[[1]]
+  }) %>% unlist()
+  
+  # 4.1 Keep only those query with names
+  kegg.query <- kegg.query[names(kegg.query.NAME)]
+  
+  # 5. Create data with Interactions
+  mapkG.edges <- edges(mapkG)
+  mat <- matrix(nrow = 0, ncol = 2, dimnames = list(c(), c('gene1', 'gene2')))
+  for ( i in names(mapkG.edges)){
+    if(length(mapkG.edges[[i]]) > 0)
+      mat <- rbind(mat , cbind(i, mapkG.edges[[i]]))
+  }
+  mat[,1] <- kegg.query.NAME[mat[,1]]
+  mat[,2] <- kegg.query.NAME[mat[,2]]
+  mat <- na.omit(mat)
+  
+  data.frame(mat) %>% 
+    write_tsv(path = res.file)
+  
+  detach("package:KEGGgraph", unload=TRUE) 
+  detach("package:KEGGREST", unload=TRUE)
+}
+
+
+# Mouse ---------------------------------------------------
+res.file <- file.path(kegg.data, 'mmu04514.tsv.txt')
+if(!file.exists(res.file)){
+  library(KEGGgraph)
+  library(KEGGREST)
+  
+  # 1. Get KGML file
+  kgml.file <- file.path(kegg.data, 'mmu04514.kgml')
+  mapkKGML <- retrieveKGML('mmu04514', organism="mmu", destfile=kgml.file, method="wget", quiet=TRUE)
+  
+  # 2. Parse to a graph
+  mapkG <- parseKGML2Graph(mapkKGML, expandGenes=TRUE)
+  mapkP <- parseKGML(mapkKGML)
+  
+  # 3. Convert nodes to gene names
+  cl <- makeCluster(6, type="FORK")
+  kegg.query <- parSapply(cl, nodes(mapkG), keggGet)
+  stopCluster(cl)
+  
+  # 4. Extact gene names from the keeg query
+  kegg.query.NAME <- lapply(kegg.query, function(x){
+    if(!is.null(x$NAME))
+      strsplit(x$NAME, ", ") %>% unlist() %>% .[[1]]
+  }) %>% unlist()
+
+  # 4.1 Keep only those query with names
+  kegg.query <- kegg.query[names(kegg.query.NAME)]
+    
+  # 5. Create data with Interactions
+  mapkG.edges <- edges(mapkG)
+  mat <- matrix(nrow = 0, ncol = 2, dimnames = list(c(), c('gene1', 'gene2')))
+  for ( i in names(mapkG.edges)){
+    if(length(mapkG.edges[[i]]) > 0)
+      mat <- rbind(mat , cbind(i, mapkG.edges[[i]]))
+  }
+  mat[,1] <- kegg.query.NAME[mat[,1]]
+  mat[,2] <- kegg.query.NAME[mat[,2]]
+  mat <- na.omit(mat)
+   
+  data.frame(mat) %>% 
+    write_tsv(path = res.file)
+  
+  detach("package:KEGGgraph", unload=TRUE) 
+  detach("package:KEGGREST", unload=TRUE)
+}
+
+
+# Load the files-------------------------------------------
+hs.cam.map <- read_tsv(file.path(kegg.data, 'hsa04514.tsv.txt')) %>% 
+  dplyr::rename(cam = gene1, receptor = gene2) %>% 
+  na.omit
+mm.cam.map <- read_tsv(file.path(kegg.data, 'mmu04514.tsv.txt')) %>% 
+  dplyr::rename(cam = gene1, receptor = gene2) %>% 
+  na.omit
+```
+
+
+<!-- Generate orthologous pathway Mouse to Human -->
+```{r}
+
+kegg.data <- './data/kegg'
+
+orth.file.mm <- file.path(kegg.data, 'mmu04514.orth.tsv.txt')
+orth.file.hs <- file.path(kegg.data, 'hsa04514.orth.tsv.txt')
+
+if(!file.exists(orth.file.mm) | !file.exists(orth.file.hs)){
+  library(biomaRt)
+  mouse.ensembl <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+  listAttributes(mouse.ensembl) %>% dplyr::filter(grepl('hsapiens', name))
+  attributes <-  c("external_gene_name","hsapiens_homolog_associated_gene_name",
+                   "hsapiens_homolog_orthology_confidence", "hsapiens_homolog_orthology_type", 
+                   "hsapiens_homolog_perc_id", "hsapiens_homolog_perc_id_r1", 
+                   "hsapiens_homolog_goc_score")
+  
+  orth.mm <-  getBM(attributes, filters="with_hsapiens_homolog", 
+                    values=TRUE, mart = mouse.ensembl, uniqueRows=TRUE) 
+  
+  # Resolve ortholog_many2many and ortholog_one2many selecting by confidence, goc score and homology %
+  orth.mm.unique <- orth.mm %>% 
+    dplyr::filter(hsapiens_homolog_orthology_confidence == 1) %>% 
+    dplyr::filter(hsapiens_homolog_goc_score >=90 ) %>%
+    # dplyr::filter(hsapiens_homolog_associated_gene_name %in% hs.cam.map$cam) %>% 
+    dplyr::arrange(desc(hsapiens_homolog_perc_id)) %>% 
+    dplyr::select(external_gene_name, hsapiens_homolog_associated_gene_name) %>% 
+    dplyr::filter(!duplicated(external_gene_name)) %>% 
+    dplyr::filter(!duplicated(hsapiens_homolog_associated_gene_name))
+  
+
+  # Add orthology information to cam map
+  mm.cam.map.hs <- mm.cam.map %>% 
+    # Add cam orthologous
+    left_join(orth.mm.unique, by = c('cam'='external_gene_name')) %>% 
+    dplyr::mutate(hsapiens_homolog_associated_gene_name = ifelse(is.na(hsapiens_homolog_associated_gene_name),
+                                                                 toupper(cam),
+                                                                 hsapiens_homolog_associated_gene_name)) %>% 
+    dplyr::rename(cam.hs = hsapiens_homolog_associated_gene_name)%>% 
+    # Add receptor orthologous
+    left_join(orth.mm.unique, by = c('receptor'='external_gene_name')) %>% 
+    dplyr::mutate(hsapiens_homolog_associated_gene_name = ifelse(is.na(hsapiens_homolog_associated_gene_name),
+                                                                 toupper(receptor),
+                                                                 hsapiens_homolog_associated_gene_name)) %>% 
+    dplyr::rename(receptor.hs = hsapiens_homolog_associated_gene_name)
+  
+  # Select only shared interactions in human and mouse othologous
+  mm.hs.cyr <- paste(mm.cam.map.hs$cam.hs, mm.cam.map.hs$receptor.hs, sep = '-')
+  hs.cyr <- paste(hs.cam.map$cam, hs.cam.map$receptor, sep = '-')
+  
+  mm.cam.map.hs <- mm.cam.map.hs[mm.hs.cyr %in% hs.cyr,]
+  hs.cam.map.mm <- hs.cam.map[hs.cyr %in% mm.hs.cyr,]
+  
+  # Write to a file
+  mm.cam.map.hs %>% 
+    write_tsv(path = orth.file.mm)
+    
+  hs.cam.map.mm %>% 
+    write_tsv(path = orth.file.hs)
+
+  detach("package:biomaRt", unload=TRUE) 
+}
+
+# Load the files-------------------------------------------
+hs.cam.map.mm <- read_tsv(orth.file.hs)
+mm.cam.map.hs <- read_tsv(orth.file.mm) 
+
+
+
+```
+
+
+# Prepare data
+Analyses performed on detached CTC and **WBC-Neutrophils** from CTC-WBC clusters obtained from mouse models, CDX and patient samples
+
+<!-- Mouse data -->
+```{r}
+
+# Select samples :
+# WBC detached from a CTC  = 'CTC.wbc'
+# CTC detached from a WBC  = 'CTC.cluster.WBC.ctc' | 'CTC.sinlge.WBC.ctc'
+sce.chunk <- sce.mm
+sample_cell_cat.sel <- c('CTC.wbc', 'CTC.cluster.WBC.ctc', 'CTC.sinlge.WBC.ctc')
+sample.sel <- 
+  colData(sce.chunk)  %>% data.frame %>% 
+    dplyr::filter(
+      organism == 'Mus musculus' 
+      ) %>%
+    dplyr::filter(
+      sample_cell_cat %in% sample_cell_cat.sel
+    ) %>% collect %>% .[['sample']]
+
+sce.mouse <-   sce.chunk[,sample.sel]
+
+
+
+# Annotate samples with both WBC and CTC detached
+clusterID.paired <- 
+  table(colData(sce.mouse)$clusterID ,
+      colData(sce.mouse)$cell_type %>% as.character) %>% 
+  as.data.frame.matrix %>%
+  rownames_to_column('clusterID') %>%
+  dplyr::filter(CTC > 0 & WBC >0) %>% 
+  collect %>% .[['clusterID']]
+
+is.paired <- colData(sce.mouse)$clusterID %in% clusterID.paired
+colData(sce.mouse)[,'Paired_WBC_CTC'] <- is.paired
+
+# Remove clusters samples that don't belong to the neutrophil cluster (clusters 0, 1 and 3 from RCA analysis)
+clusterID.neutrophil <- colData(sce.mouse) %>% data.frame %>% dplyr::filter(rca.cluster == '1' | rca.cluster == '3' | rca.cluster == '0') %>% collect %>% .[['clusterID']]
+use.clusters <- colData(sce.mouse)$clusterID %in% clusterID.neutrophil
+sce.mouse <- sce.mouse[,use.clusters]
+
+```
+
+<!-- Patient data -->
+```{r}
+
+# Select samples :
+# WBC detached from a CTC  = 'CTC.wbc'
+# CTC detached from a WBC  = 'CTC.cluster.WBC.ctc' | 'CTC.single.WBC.ctc'
+sce.chunk <- sce.hs
+sample_cell_cat.sel <- c('CTC.wbc', 'CTC.cluster.WBC.ctc', 'CTC.single.WBC.ctc')
+sample.sel <- 
+  colData(sce.chunk)  %>% data.frame %>% 
+    dplyr::filter(
+      origin == 'patient' 
+      ) %>%
+    dplyr::filter(
+      sample_cell_cat %in% sample_cell_cat.sel
+    ) %>% collect %>% .[['sample']]
+
+sce.patients.pure <-   sce.chunk[,sample.sel]
+
+
+# Annotate samples with both WBC and CTC detached
+clusterID.paired <- 
+  table(colData(sce.patients.pure)$clusterID ,
+      colData(sce.patients.pure)$cell_type %>% as.character) %>% 
+  as.data.frame.matrix %>%
+  rownames_to_column('clusterID') %>%
+  dplyr::filter(CTC > 0 & WBC >0) %>% 
+  collect %>% .[['clusterID']]
+
+is.paired <- colData(sce.patients.pure)$clusterID %in% clusterID.paired
+colData(sce.patients.pure)[,'Paired_WBC_CTC'] <- is.paired
+
+
+# Remove clusters samples that don't belong to the neutrophil cluster (clusters 1 from RCA analysis)
+clusterID.neutrophil <- colData(sce.patients.pure) %>% data.frame %>% dplyr::filter(rca.cluster == '1') %>% collect %>% .[['clusterID']]
+use.clusters <- colData(sce.patients.pure)$clusterID %in% clusterID.neutrophil
+sce.patients.pure <- sce.patients.pure[,use.clusters]
+
+
+```
+
+<!-- CDX data -->
+```{r}
+
+# Shared clusteID from human and mouse cells
+shared.clusterID <- intersect(sce.hs$clusterID, sce.mm$clusterID)
+shared.clusterID <- shared.clusterID[shared.clusterID != 'NA']
+
+# From human, select samples :
+# CTC detached from a WBC  = 'CTC.cluster.WBC.ctc' | 'CTC.single.WBC.ctc'
+sce.chunk <- sce.hs
+sample_cell_cat.sel <- c('CTC.cluster.WBC.ctc', 'CTC.single.WBC.ctc')
+sample.sel <- 
+  colData(sce.chunk)  %>% data.frame %>% 
+    dplyr::filter(
+      origin == 'xenograft' 
+      ) %>%
+    dplyr::filter(
+      sample_cell_cat %in% sample_cell_cat.sel & 
+      clusterID %in% shared.clusterID
+    ) %>% 
+  collect %>% .[['sample']]
+sce.cdx.hs <-   sce.chunk[,sample.sel]
+
+# From Mouse, select samples :
+# WBC detached from a CTC  = 'CTC.wbc'
+sce.chunk <- sce.mm
+sample_cell_cat.sel <- c('CTC.wbc')
+sample.sel <- 
+  colData(sce.chunk)  %>% data.frame %>% 
+    dplyr::filter(
+      organism == 'Mus musculus' 
+      ) %>%
+    dplyr::filter(
+      sample_cell_cat %in% sample_cell_cat.sel & 
+      clusterID %in% shared.clusterID
+    ) %>% collect %>% .[['sample']]
+sce.cdx.mm <- sce.chunk[,sample.sel]
+
+
+# Remove clusters samples that don't belong to the neutrophil cluster (clusters 0, 1 and 3 from RCA analysis)
+clusterID.neutrophil <- colData(sce.cdx.mm) %>% data.frame %>% dplyr::filter(rca.cluster == '1' | rca.cluster == '3' | rca.cluster == '0') %>% collect %>% .[['clusterID']]
+use.clusters.mm <- colData(sce.cdx.mm)$clusterID %in% clusterID.neutrophil
+use.clusters.hs <- colData(sce.cdx.hs)$clusterID %in% clusterID.neutrophil
+sce.cdx.mm <- sce.cdx.mm[,use.clusters.mm]
+sce.cdx.hs <- sce.cdx.hs[,use.clusters.hs]
+```
+
+<!-- Create data with cam-receptor expression in mouse -->
+```{r}
+
+cam.map <- mm.cam.map.hs %>% data.frame
+sce.chunk <- sce.mouse
+
+# Remove non-paired samples
+use.sample <- colData(sce.chunk)$Paired_WBC_CTC
+sce.chunk <- sce.chunk[,use.sample]
+
+# Select only CAM-Receptor pairs that are present in the data
+use.cam <- cam.map$cam %in% rownames(sce.chunk)
+use.receptor <- cam.map$receptor %in% rownames(sce.chunk)
+cam.map <- cam.map[use.cam & use.receptor,]
+
+# Sample annotation
+sample.annot <- colData(sce.chunk)[,c('organism', 'donor', 'sample', 'clusterID', 'cell_type')] %>% data.frame %>% 
+  dplyr::mutate(cell_type = as.character(cell_type))
+
+# Correct clusterId with duplicated cell type (i.e: 1 WBC and 2 CTC samples), creating all combinations of CTC and WBC for the same clusterID
+sample.annot.ctc <- sample.annot %>% dplyr::filter(cell_type == 'CTC')
+res <- c()
+for (ctc.sample in sample.annot.ctc$sample){
+  organism <-  sample.annot[sample.annot$sample == ctc.sample, 'organism']
+  donor <-  sample.annot[sample.annot$sample == ctc.sample, 'donor']
+  clusterID <-  sample.annot[sample.annot$sample == ctc.sample, 'clusterID']
+  samples.wbc <- sample.annot[sample.annot$clusterID == clusterID, ] %>% 
+    dplyr::filter(cell_type == 'WBC') %>% 
+    collect %>% .[['sample']]
+  for(wbc.sample in samples.wbc){
+    res <- rbind(res, 
+                 c(organism = organism, donor = donor, CTC = ctc.sample, WBC = wbc.sample, clusterID = clusterID))
+  }  
+}
+res <- res %>% data.frame(stringsAsFactors = FALSE)
+res$clusterID <- make.names(res$clusterID, unique = T)
+
+sample.annot.comb <- res
+
+# Create data with cam and receptor expression
+cyr.dat <- c()
+i <- 1
+for(i in 1:nrow(cam.map)){
+  use.dat <- sample.annot.comb
+    
+  use.dat$cam <- cam.map[i, 'cam']
+  use.dat$receptor <- cam.map[i, 'receptor']
+  use.dat$cr.id <- paste(use.dat$cam, use.dat$receptor, sep = '-')
+
+  use.dat$cam.wbc.expr <- unique(logcounts(sce.chunk)[use.dat$cam, use.dat$WBC])[1,]
+  use.dat$cam.ctc.expr <- unique(logcounts(sce.chunk)[use.dat$cam, use.dat$CTC])[1,]
+  use.dat$receptor.wbc.expr <- unique(logcounts(sce.chunk)[use.dat$receptor, use.dat$WBC])[1,]
+  use.dat$receptor.ctc.expr <- unique(logcounts(sce.chunk)[use.dat$receptor, use.dat$CTC])[1,]
+
+  cyr.dat <- rbind(cyr.dat, use.dat)
+}
+
+cyr.dat.mm <- cyr.dat
+
+```
+
+<!-- Create data with cam-receptor expression in human -->
+```{r}
+
+cam.map <- hs.cam.map.mm %>% data.frame
+sce.chunk <- sce.patients.pure
+
+# Remove non-paired samples
+use.sample <- colData(sce.chunk)$Paired_WBC_CTC
+sce.chunk <- sce.chunk[,use.sample]
+
+# Select only CAM-Receptor pairs that are present in the data
+use.cam <- cam.map$cam %in% rownames(sce.chunk)
+use.receptor <- cam.map$receptor %in% rownames(sce.chunk)
+cam.map <- cam.map[use.cam & use.receptor,]
+
+# Sample annotation
+sample.annot <- colData(sce.chunk)[,c('organism', 'donor', 'sample', 'clusterID', 'cell_type')] %>% data.frame %>% 
+  dplyr::mutate(cell_type = as.character(cell_type))
+
+# Correct clusterId with duplicated cell type (i.e: 1 WBC and 2 CTC samples), creating all combinations of CTC and WBC for the same clusterID
+sample.annot.ctc <- sample.annot %>% dplyr::filter(cell_type == 'CTC')
+res <- c()
+for (ctc.sample in sample.annot.ctc$sample){
+  organism <-  sample.annot[sample.annot$sample == ctc.sample, 'organism']
+  donor <-  sample.annot[sample.annot$sample == ctc.sample, 'donor']
+  clusterID <-  sample.annot[sample.annot$sample == ctc.sample, 'clusterID']
+  samples.wbc <- sample.annot[sample.annot$clusterID == clusterID, ] %>% 
+    dplyr::filter(cell_type == 'WBC') %>% 
+    collect %>% .[['sample']]
+  for(wbc.sample in samples.wbc){
+    res <- rbind(res, 
+                 c(organism = organism, donor = donor, CTC = ctc.sample, WBC = wbc.sample, clusterID = clusterID))
+  }  
+}
+res <- res %>% data.frame(stringsAsFactors = FALSE)
+res$clusterID <- make.names(res$clusterID, unique = T)
+
+sample.annot.comb <- res
+
+# Create data with cam and receptor expression
+cyr.dat <- c()
+i <- 1
+for(i in 1:nrow(cam.map)){
+  use.dat <- sample.annot.comb
+    
+  use.dat$cam <- cam.map[i, 'cam']
+  use.dat$receptor <- cam.map[i, 'receptor']
+  use.dat$cr.id <- paste(use.dat$cam, use.dat$receptor, sep = '-')
+
+  use.dat$cam.wbc.expr <- unique(logcounts(sce.chunk)[use.dat$cam, use.dat$WBC])[1,]
+  use.dat$cam.ctc.expr <- unique(logcounts(sce.chunk)[use.dat$cam, use.dat$CTC])[1,]
+  use.dat$receptor.wbc.expr <- unique(logcounts(sce.chunk)[use.dat$receptor, use.dat$WBC])[1,]
+  use.dat$receptor.ctc.expr <- unique(logcounts(sce.chunk)[use.dat$receptor, use.dat$CTC])[1,]
+
+  cyr.dat <- rbind(cyr.dat, use.dat)
+}
+
+cyr.dat.hs <- cyr.dat
+
+```
+
+<!-- Create data with cam-receptor expression in CDX -->
+```{r}
+
+# samples.paired
+cam.map <- mm.cam.map.hs %>% data.frame
+sce.chunk.mm <- sce.cdx.mm
+sce.chunk.hs <- sce.cdx.hs
+
+# Remove non-paired samples
+clusterID.paired <- intersect(colData(sce.chunk.hs)$clusterID, colData(sce.chunk.mm)$clusterID)
+paired.samples.mm <- colData(sce.chunk.mm) %>% data.frame %>% 
+  dplyr::filter(cell_type == 'WBC') %>% 
+  dplyr::filter(clusterID %in% clusterID.paired) %>% 
+  collect %>% .[['sample']]
+paired.samples.hs <- colData(sce.chunk.hs) %>% data.frame %>% 
+  dplyr::filter(cell_type == 'CTC') %>% 
+  dplyr::filter(clusterID %in% clusterID.paired) %>% 
+  collect %>% .[['sample']]
+sce.chunk.mm <- sce.chunk.mm[,paired.samples.mm]
+sce.chunk.hs <- sce.chunk.hs[,paired.samples.hs]
+
+# Convert gene names in mouse to human
+# rownames(sce.chunk.mm) <- toupper(rownames(sce.chunk.mm))
+
+# Select only CAM-Receptor pairs that are present in the data
+use.cam.mm <- cam.map$cam %in% rownames(sce.chunk.mm)
+use.receptor.mm <- cam.map$receptor %in% rownames(sce.chunk.mm)
+use.cam.hs <- cam.map$cam.hs %in% rownames(sce.chunk.hs)
+use.receptor.hs <- cam.map$receptor.hs %in% rownames(sce.chunk.hs)
+cam.map <- cam.map[use.cam.mm & use.cam.hs & use.receptor.mm & use.receptor.hs,]
+
+# Sample annotation
+sample.annot.hs <- colData(sce.chunk.hs)[,c('organism', 'donor', 'sample', 'clusterID', 'cell_type')] %>% data.frame %>% 
+  dplyr::mutate(cell_type = as.character(cell_type))
+sample.annot.mm <- colData(sce.chunk.mm)[,c('organism', 'donor', 'sample', 'clusterID', 'cell_type')] %>% data.frame %>% 
+  dplyr::mutate(cell_type = as.character(cell_type))
+
+# Correct clusterId with duplicated cell type (i.e: 1 WBC and 2 CTC samples), creating all combinations of CTC and WBC for the same clusterID
+sample.annot.ctc <- sample.annot.hs %>% dplyr::filter(cell_type == 'CTC')
+sample.annot.wbc <- sample.annot.mm %>% dplyr::filter(cell_type == 'WBC')
+res <- c()
+for (ctc.sample in sample.annot.ctc$sample){
+  organism <- 'cdx'
+  donor <-  sample.annot.ctc[sample.annot.ctc$sample == ctc.sample, 'donor']
+  clusterID <-  sample.annot.ctc[sample.annot.ctc$sample == ctc.sample, 'clusterID']
+  samples.wbc <- sample.annot.wbc[sample.annot.wbc$clusterID == clusterID, ] %>% 
+    collect %>% .[['sample']]
+  for(wbc.sample in samples.wbc){
+    res <- rbind(res, 
+                 c(organism = organism, donor = donor, CTC = ctc.sample, WBC = wbc.sample, clusterID = clusterID))
+    }
+}
+res <- res %>% data.frame(stringsAsFactors = FALSE)
+res$clusterID <- make.names(res$clusterID, unique = T)
+
+sample.annot.comb <- res
+
+# Create data with cam and receptor expression
+cyr.dat <- c()
+i <- 1
+for(i in 1:nrow(cam.map)){
+  use.dat <- sample.annot.comb
+    
+  use.cam.mm <- cam.map[i, 'cam']
+  use.receptor.mm <- cam.map[i, 'receptor']
+  use.cam.hs <- cam.map[i, 'cam.hs']
+  use.receptor.hs <- cam.map[i, 'receptor.hs']
+  
+  use.dat$cam <- use.cam.hs
+  use.dat$receptor <- use.receptor.hs
+  use.dat$cr.id <- paste(use.dat$cam, use.dat$receptor, sep = '-')
+
+  use.dat$cam.wbc.expr <- logcounts(sce.chunk.mm)[use.cam.mm, use.dat$WBC]
+  use.dat$cam.ctc.expr <- logcounts(sce.chunk.hs)[use.cam.hs, use.dat$CTC]
+  use.dat$receptor.wbc.expr <- logcounts(sce.chunk.mm)[use.receptor.mm, use.dat$WBC]
+  use.dat$receptor.ctc.expr <- logcounts(sce.chunk.hs)[use.receptor.hs, use.dat$CTC]
+
+  cyr.dat <- rbind(cyr.dat, use.dat)
+}
+
+cyr.dat.cdx <- cyr.dat
+
+```
+
+<!-- Merge mouse, human and cdx cam-receptor expression data-->
+```{r}
+
+cyr.dat.mm <- cyr.dat.mm %>% 
+  left_join(mm.cam.map.hs) %>% 
+  dplyr::mutate(
+    cam = cam.hs,
+    receptor = receptor.hs,
+    cr.id = paste(cam, receptor, sep = '-')
+    ) %>% 
+  dplyr::select(-cam.hs, -receptor.hs)
+
+
+cyr.dat <- rbind(cyr.dat.hs, cyr.dat.mm, cyr.dat.cdx)
+
+```
+
+
+# Figures
+<!-- Configuration -->
+```{r}
+
+logCPM.thrs <- log2(5)
+
+cyr.dycho <- cyr.dat %>% 
+  dplyr::mutate(
+    cam.wbc.expr = cam.wbc.expr > logCPM.thrs,
+    cam.ctc.expr = cam.ctc.expr > logCPM.thrs,
+    receptor.wbc.expr = receptor.wbc.expr > logCPM.thrs,
+    receptor.ctc.expr = receptor.ctc.expr > logCPM.thrs
+  )
+
+```
+
+## Extended Data Fig. 10a
+Heatmap showing the expression landscape of CAMs amd corresponding receptors expressed in at least 20% of CTC-neutrophil clusters.
+```{r, fig.height=5, fig.width=12}
+
+cyr.use <- cyr.dycho %>% 
+  dplyr::mutate(
+    cyr.cat = 'None',
+    cyr.cat = ifelse(cam.wbc.expr, 'CAM Expressed', cyr.cat),
+    cyr.cat = ifelse(receptor.ctc.expr, 'Receptor Expressed', cyr.cat),
+    cyr.cat = ifelse(cam.wbc.expr & receptor.ctc.expr, 'CAM-Receptor Expressed', cyr.cat)
+  )
+
+cyr.spread <- cyr.use %>% dplyr::select(clusterID, cr.id, cyr.cat) %>%  spread(key = clusterID, value = cyr.cat)
+rownames(cyr.spread) <- cyr.spread$cr.id
+cyr.spread$cr.id <- NULL
+cyr.spread[is.na(cyr.spread)] <- 'None'
+mat <- as.matrix(cyr.spread)
+
+# Heatmap
+# Rows sorted by : Number of samples with  'CAM-Receptor Expressed'
+# Columns sorted by number of combinations scaled by the combination order
+cyr.row <- rowSums(mat == 'CAM-Receptor Expressed')
+row.ord <- order(cyr.row, decreasing = TRUE)
+col.score <- apply(mat[row.ord,], 2, function(x){
+    x = x %>% factor %>% plyr::revalue(c('Cytokine-Receptor Expressed' = 10, 'Cytokine Expressed'= 3, 'Receptor Expressed' = 3, 'None' = -1)) %>% as.character %>% as.numeric()
+    sum(x*(rev(seq_along(x))^100))
+})
+col.names.ord <- sort(col.score, decreasing = T) %>% names()
+heat.colors <- c('CAM-Receptor Expressed' = "#BC3C29FF", 'CAM Expressed'= "#f6e8c3", 'Receptor Expressed' = "#79AF97B2", 'None' = "grey90")
+
+
+# Columns sorted by donor
+col.names.ord <- cyr.use %>% dplyr::filter(cyr.use$clusterID %in% colnames(cyr.spread)) %>% dplyr::select(donor, clusterID) %>% unique %>% dplyr::arrange(donor) %>% collect %>% .[['clusterID']]
+
+
+mat.sel <- mat[row.ord,col.names.ord]
+use.rows <- (rowSums(mat.sel == 'CAM-Receptor Expressed') / ncol(mat.sel))>=0.20
+mat.sel <- mat.sel[use.rows,]
+
+
+# Col annotation
+sampleAnnot <- cyr.dycho %>% dplyr::select(organism, donor, CTC, WBC, clusterID) %>% unique %>% 
+  dplyr::mutate(
+    organism.ord = organism,
+    organism.ord = ifelse(organism.ord == 'Homo sapiens', '1.Homo sapiens', organism.ord),
+    organism.ord = ifelse(organism.ord == 'cdx', '2.cdx', organism.ord),
+    organism.ord = ifelse(organism.ord == 'Mus musculus', '3.Mus musculus', organism.ord),
+    donor.org = paste0(donor, " (", organism, ")"),
+    org.donor = paste0(organism.ord, ": ", donor)
+    ) %>% 
+  dplyr::arrange(org.donor)
+rownames(sampleAnnot) <- sampleAnnot$clusterID
+sampleAnnot <- sampleAnnot %>% dplyr::select(donor.org)
+use.rows <- rownames(sampleAnnot) %in% colnames(mat.sel)
+sampleAnnot <- sampleAnnot[use.rows,,drop = FALSE]
+donor.levels <- unique(sampleAnnot$donor.org)
+donor.col <- pal_uchicago(alpha = 0.7)(length(donor.levels))
+names(donor.col) <- donor.levels
+ha.col <-  HeatmapAnnotation(
+  sampleAnnot, 
+  col = list(
+    donor.org = donor.col
+  ),
+  annotation_legend_param = list(
+    donor.org = list( 
+      labels_gp = gpar(fontsize = 13),
+      # legend_direction = "horizontal",
+      grid_height = unit(8, "mm"),
+      grid_width = unit(8, "mm"),
+      title = "",
+      nrow = 1
+      )
+  )
+)
+
+
+# Core heatmap
+mat.sel <- mat.sel[,rownames(sampleAnnot)]
+ht <- Heatmap(
+  mat.sel,
+  row_names_side = "left", 
+  col = heat.colors,
+  rect_gp = gpar(col = 'grey70'),
+  name = '',
+  top_annotation = ha.col,
+  show_column_names = FALSE,
+  heatmap_legend_param = list(
+    labels_gp = gpar(fontsize = 13),
+    legend_direction = "horizontal",
+    grid_height = unit(8, "mm"),
+    grid_width = unit(8, "mm"),
+    title_gp = gpar(fontsize = 13, fontface = 'bold'),
+    nrow = 2
+  )
+)
+
+# draw(ht, heatmap_legend_side = "bottom", annotation_legend_side = "top")
+
+# Row Annotations
+n.cyr.row <- 100*rowSums(mat.sel == "CAM-Receptor Expressed") / ncol(mat.sel)
+n.cyr.row.col <- rep("grey90", length(n.cyr.row))
+
+ha.row <-  rowAnnotation(
+  n.samples = row_anno_barplot(n.cyr.row, axis = TRUE, gp = gpar(fill = "grey90")),
+  annotation_width = unit(2, "cm"))
+
+
+draw(ht + ha.row, heatmap_legend_side = "bottom", annotation_legend_side = "top")
+
+decorate_annotation("n.samples", {
+    grid.text("Percent of pairs", unit(10, "mm"), unit(-14, "mm"), just = "bottom", rot = 0, gp = gpar(cex = 0.5))
+})
+
+```
+
+## Extended Data Fig. 10b
+Heatmap showing the expression landscape of CAMs receptors and corresponding CAMs expressed in at least 20% of CTC-neutrophil clusters.
+```{r, fig.height=5.5, fig.width=12}
+
+cyr.use <- cyr.dycho %>% 
+  dplyr::mutate(
+    cyr.cat = 'None',
+    cyr.cat = ifelse(cam.ctc.expr, 'CAM Expressed', cyr.cat),
+    cyr.cat = ifelse(receptor.wbc.expr, 'Receptor Expressed', cyr.cat),
+    cyr.cat = ifelse(cam.ctc.expr & receptor.wbc.expr, 'CAM-Receptor Expressed', cyr.cat)
+  )
+
+cyr.spread <- cyr.use %>% dplyr::select(clusterID, cr.id, cyr.cat) %>%  spread(key = clusterID, value = cyr.cat)
+rownames(cyr.spread) <- cyr.spread$cr.id
+cyr.spread$cr.id <- NULL
+cyr.spread[is.na(cyr.spread)] <- 'None'
+mat <- as.matrix(cyr.spread)
+
+
+# Heatmap
+# Rows sorted by : Number of samples with  'CAM-Receptor Expressed'
+# Columns sorted by number of combinations scaled by the combination order
+cyr.row <- rowSums(mat == 'CAM-Receptor Expressed')
+row.ord <- order(cyr.row, decreasing = TRUE)
+col.score <- apply(mat[row.ord,], 2, function(x){
+    x = x %>% factor %>% plyr::revalue(c('Cytokine-Receptor Expressed' = 10, 'Cytokine Expressed'= 3, 'Receptor Expressed' = 3, 'None' = -1)) %>% as.character %>% as.numeric()
+    sum(x*(rev(seq_along(x))^100))
+})
+col.names.ord <- sort(col.score, decreasing = T) %>% names()
+heat.colors <- c('CAM-Receptor Expressed' = "#BC3C29FF", 'CAM Expressed'= "#f6e8c3", 'Receptor Expressed' = "#79AF97B2", 'None' = "grey90")
+
+
+# Columns sorted by donor
+col.names.ord <- cyr.use %>% dplyr::filter(cyr.use$clusterID %in% colnames(cyr.spread)) %>% dplyr::select(donor, clusterID) %>% unique %>% dplyr::arrange(donor) %>% collect %>% .[['clusterID']]
+
+
+mat.sel <- mat[row.ord,col.names.ord]
+use.rows <- (rowSums(mat.sel == 'CAM-Receptor Expressed') / ncol(mat.sel))>=0.20
+mat.sel <- mat.sel[use.rows,]
+
+
+# Col annotation
+sampleAnnot <- cyr.dycho %>% dplyr::select(organism, donor, CTC, WBC, clusterID) %>% unique %>% 
+  dplyr::mutate(
+    organism.ord = organism,
+    organism.ord = ifelse(organism.ord == 'Homo sapiens', '1.Homo sapiens', organism.ord),
+    organism.ord = ifelse(organism.ord == 'cdx', '2.cdx', organism.ord),
+    organism.ord = ifelse(organism.ord == 'Mus musculus', '3.Mus musculus', organism.ord),
+    donor.org = paste0(donor, " (", organism, ")"),
+    org.donor = paste0(organism.ord, ": ", donor)
+    ) %>% 
+  dplyr::arrange(org.donor)
+rownames(sampleAnnot) <- sampleAnnot$clusterID
+sampleAnnot <- sampleAnnot %>% dplyr::select(donor.org)
+use.rows <- rownames(sampleAnnot) %in% colnames(mat.sel)
+sampleAnnot <- sampleAnnot[use.rows,,drop = FALSE]
+donor.levels <- unique(sampleAnnot$donor.org)
+donor.col <- pal_uchicago(alpha = 0.7)(length(donor.levels))
+names(donor.col) <- donor.levels
+ha.col <-  HeatmapAnnotation(
+  sampleAnnot, 
+  col = list(
+    donor.org = donor.col
+  ),
+  annotation_legend_param = list(
+    donor.org = list( 
+      labels_gp = gpar(fontsize = 13),
+      # legend_direction = "horizontal",
+      grid_height = unit(8, "mm"),
+      grid_width = unit(8, "mm"),
+      title = "",
+      nrow = 1
+      )
+  )
+)
+
+
+# Core heatmap
+mat.sel <- mat.sel[,rownames(sampleAnnot)]
+ht <- Heatmap(
+  mat.sel,
+  row_names_side = "left", 
+  col = heat.colors,
+  rect_gp = gpar(col = 'grey70'),
+  name = '',
+  top_annotation = ha.col,
+  show_column_names = FALSE,
+  heatmap_legend_param = list(
+    labels_gp = gpar(fontsize = 13),
+    legend_direction = "horizontal",
+    grid_height = unit(8, "mm"),
+    grid_width = unit(8, "mm"),
+    title_gp = gpar(fontsize = 13, fontface = 'bold'),
+    nrow = 2
+  )
+)
+
+
+# Row Annotations
+n.cyr.row <- 100*rowSums(mat.sel == "CAM-Receptor Expressed") / ncol(mat.sel)
+n.cyr.row.col <- rep("grey90", length(n.cyr.row))
+
+ha.row <-  rowAnnotation(
+  n.samples = row_anno_barplot(n.cyr.row, axis = TRUE, gp = gpar(fill = "grey90")),
+  annotation_width = unit(c(2, 2), "cm"))
+
+
+draw(ht + ha.row, heatmap_legend_side = "bottom", annotation_legend_side = "top")
+
+decorate_annotation("n.samples", {
+    grid.text("Percent of pairs", unit(10, "mm"), unit(-14, "mm"), just = "bottom", rot = 0, gp = gpar(cex = 0.5))
+})
+
+```
+

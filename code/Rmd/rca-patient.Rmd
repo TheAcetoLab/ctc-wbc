@@ -1,0 +1,535 @@
+---
+title: "Determination of white blood cell type attached to circulating tumor cells in patients using RNA-seq data"
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  output: html
+  root_dir: ../../
+  min.readCount: 5
+  min.samplesExpressed: 3
+output:
+  html_document:
+    number_sections: yes
+    theme: journal
+    highlight: pygments
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+  pdf_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: '4'
+---
+
+
+
+# Setup
+
+<!-- Setup Font for PDF -->
+\fontfamily{phv}
+\fontsize{8}{12}
+\selectfont
+\newpage
+
+<!-- Analysis directories and global chunk options -->
+```{r setup, include = FALSE}
+# Working directory
+knitr::opts_knit$set(root.dir = normalizePath(params$root_dir))
+setwd(params$root_dir)
+
+# Results directory
+dir.res <- 'results/rca'
+if(!file.exists(dir.res))
+  dir.create(dir.res, recursive = TRUE)
+
+
+# Global chunk options
+knitr::opts_chunk$set(fig.align='center', results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, include = TRUE)
+```
+
+<!-- General Libraries -->
+```{r libraries, include = FALSE}
+# Src CRAN
+library(tidyverse)
+library(gridExtra)
+library(circlize)
+library(cowplot)
+library(ggsci)
+library(RColorBrewer)
+library(pander)
+library(DT)
+library(WGCNA)
+
+# Src github
+library(RCA) # https://github.com/GIS-SP-Group/RCA
+
+# Src Bioconductor
+library(scater)
+
+```
+
+<!-- Additional Functions -->
+```{r functions, include = FALSE}
+# Require the libraries : 
+# ComplexHeatmap,circlize, dendextend, RColorBrewer, plyr, wesanderson, scales
+source('./code/R-functions/clustering.r')
+
+# Heat Colors Generator
+heatCol.gen <- function(x, limits = NULL, center = FALSE, pal = 'YlGnBu', reverse.pal = FALSE) {
+  require(tmaptools)
+  use.limits <- range(x)
+  if(!is.null(limits)) {
+   use.limits <- limits
+  }
+  if(center) {
+    maxVal <- max(abs(range(x)))
+    use.limits <- c(-maxVal, maxVal)
+  }
+  pal.colors <- tmaptools::get_brewer_pal(pal, 20, plot = FALSE)
+  if(reverse.pal) {
+   pal.colors <- rev(pal.colors)
+  }
+  circlize::colorRamp2(
+   seq(use.limits[1], use.limits[2],length.out = 20),
+   pal.colors
+  )
+}
+
+# Add alpha to colors
+add.alpha <- function(x, alpha=1){
+  if(missing(x))
+    stop("Please provide a vector of colours.")
+  apply(sapply(x, col2rgb)/255, 2, 
+                     function(y) 
+                       rgb(y[1], y[2], y[3], alpha=alpha))  
+}
+
+```
+
+<!-- PDF panderOptions for pandoc -->
+```{r panderOptions, include = FALSE}
+pander::panderOptions('table.alignment.default', 'right')
+pander::panderOptions('table.alignment.rownames', 'left')
+pander::panderOptions('table.split.table', Inf)
+pander::panderOptions('table.caption.prefix', 'Table : ')
+```
+
+# Load data
+<!-- Load featureCounts SCE-->
+```{r}
+sce <- readRDS('data/sce_hs.rds')
+```
+
+<!-- Annotate and filter SCE -->
+```{r}
+# Select samples
+useSamples <-  colData(sce) %>% data.frame %>% 
+  dplyr::filter(
+    origin == 'patient' 
+    ) %>% 
+  dplyr::filter(
+    cell_type == "CTC-WBC" |
+    cell_type == "WBC" |
+    grepl("reference", comments)
+    ) %>% 
+  collect %>% .[['sample']]
+
+# Filter sce
+endog_genes <- !rowData(sce)$is_feature_control
+useSce <- sce[endog_genes, useSamples]
+
+# Filter Genes
+keep_genes <- rowSums(counts(useSce) >= params$min.readCount) >= params$min.samplesExpressed
+rowData(useSce)$use <- keep_genes
+keep_genes_names <- names(keep_genes)[keep_genes]
+useSce <- useSce[rowData(useSce)$use,]
+
+
+```
+
+# Quality control
+
+
+## Expression of CD45
+
+Removing CTC-WBC samples without CD45 expression
+```{r}
+sce.chunk <- useSce
+gene <- c('PTPRC')
+
+# Get expression values
+mat <- exprs(sce.chunk)[gene,, drop = FALSE]
+mat <- data.frame(t(mat))
+
+# Add annotation to mat
+annot <- colData(sce.chunk)[rownames(mat), c("sample_cell_cat", "cell_type", "n_ctc", "n_wbc_attached")]
+
+mat <- cbind(mat, annot) %>% data.frame %>% 
+  tibble::rownames_to_column(var='samples') %>%
+  gather(-sample_cell_cat, -cell_type, -samples, -samples, -n_ctc, -n_wbc_attached,
+         key = "gene", value = "expression") %>% 
+  dplyr::mutate(
+    sample_cell_cat = as.character(sample_cell_cat),
+    sample_cell_cat = factor(sample_cell_cat, levels = sort(unique(sample_cell_cat)))
+    )
+
+# Samples CTC+WBC to remove for the WBC analysis
+CTC.wbc.cd45null <- mat %>%
+  dplyr::filter(sample_cell_cat == "CTC.wbc" &
+                  expression < 5) %>% 
+  collect %>% 
+  .[["samples"]]
+
+
+```
+
+
+
+## Identification of CTC specific genes
+<!-- Configuration -->
+```{r}
+min.prop <- 0.05
+min.log10.fc <- 0.69897
+
+selected.samples <- colData(sce) %>% data.frame %>% 
+  dplyr::filter(is.hs == TRUE) %>%
+  dplyr::filter(is.mm == FALSE) %>%
+  dplyr::filter(origin == 'patient') %>%
+  dplyr::filter(cell_type == "CTC" | 
+                  cell_type == "WBC" | 
+                  grepl("reference", comments))
+
+```
+
+Genes expressed in CTC were selected on the basis of specific expression in CTC compared to a reference set of WBC samples. A gene was defined as CTC specific if the log10 fold change of its normalized expression relative to the median across the refence set exceeded `r min.log10.fc` (FC = `r 10^min.log10.fc`),  in at least `100*min.prop`% of the samples.
+
+Selected samples : 
+
+  * CTC sample selected are any single CTC or CTC alone isolated from clusters (either CTC cluster or CTC-WBC)
+  
+  * Reference samples are those annotated as reference (B cells, T cells, Granulocytes, Monocytes, NK, Platelets) and unknown WBC from normal donors. The WBC isolated from CTC were excluded for this analysis
+  
+  * Only patient samples were used, excluding those from mice xenografts
+
+```{r}
+# Keep endogenous genes and filter samples
+endog_genes <- !rowData(sce)$is_feature_control
+sce.chunk <- sce[endog_genes, selected.samples$sample]
+
+# Median expression among WBC-reference samples
+ref.samples <- colData(sce.chunk)$cell_type != "CTC"
+ref.exprs <- 2^exprs(sce.chunk)[,ref.samples]
+ref.exprs.medians <- rowMedians(ref.exprs, na.rm = FALSE)
+
+# Expression from CTC
+ctc.samples <- colData(sce.chunk)$cell_type == "CTC"
+ctc.exprs <- 2^exprs(sce.chunk)[,ctc.samples]
+
+# Fold-Change CTC relative to the median in ref samples
+ctc.fc <- apply(ctc.exprs, 2, function(x) x/ref.exprs.medians)
+ctc.fc <- log10(ctc.fc)
+
+# Select genes with log10.Fc > 1 in a % of the CTC samples
+ctc.fc.min.prop <- rowMeans(ctc.fc > min.log10.fc) >= min.prop
+
+ctc.genes <- names(ctc.fc.min.prop)[ctc.fc.min.prop]
+```
+
+
+
+
+
+
+
+
+# RCA clusters
+
+Reference Component Analysis (RCA) is an algorithm for robustly cluster single-cell transcriptomes [Li et al. (2017)](https://www.nature.com/ng/journal/v49/n5/full/ng.3818.html). As a reference populations we use bulk transcriptomes from the HumanU133A/GNF1H Gene Atlas and the Primary Cell Atlas data (see online methods from [Li et al. (2017)](https://www.nature.com/ng/journal/v49/n5/full/ng.3818.html) ).
+
+## Select samples
+
+  * remove CTC-WBC samples with zero expression of PTPRC (CD45)
+
+  * remove undetermined WBC and platelets from the reference sample panel
+
+```{r}
+# Sample selection
+rmSamples <-  c('REF.Platelets', 'REF.WBC')
+useSamples <- rownames(colData(useSce))
+if(!is.null(rmSamples))
+ useSamples <- rownames(colData(useSce))[!colData(useSce)$sample_cell_cat %in% rmSamples]
+
+# Remove CTC+WBC samples with null CD45 expression
+useSamples <- setdiff(useSamples, CTC.wbc.cd45null)
+```
+
+## Prepare RCA data
+
+```{r}
+# Sample selection from defined annotation
+fpkm_data <- fpkm(useSce)[, useSamples]
+# Modify gene names
+rownames(fpkm_data) <- paste0("XXXX_", rownames(fpkm_data), "_ENSYYYY")
+# construct data object
+data_obj <-  dataConstruct(fpkm_data)
+# filt out lowly expressed genes
+data_obj <- geneFilt(obj_in = data_obj)
+# normalize gene expression data (Note: default is no normalization). 
+data_obj <- cellNormalize(data_obj, 'no_norm')
+# log transform the data
+data_obj <- dataTransform(data_obj, "log10")
+
+data_obj_use <- data_obj
+
+# Gene Selection
+useGenes <- rowData(useSce)$Geneid[!rowData(useSce)$Geneid %in% ctc.genes]
+useGenes <- paste0("XXXX_", useGenes, "_ENSYYYY")
+useGenes <- useGenes[useGenes %in% rownames(data_obj_use$fpkm_transformed)]
+data_obj_use$fpkm_transformed <- data_obj_use$fpkm_transformed[useGenes, ]
+
+```
+
+
+## Run RCA
+```{r}
+# remove X at the beggining of the name : put automatically by normalization (low coverage??)
+colnames(data_obj_use$fpkm_transformed) <- colnames(data_obj_use$fpkm)
+# project the expression data into Reference Component space
+data_obj_use <- featureConstruct(data_obj_use, method = 'GlobalPanel')
+# clean data : filter cell types with low correlation
+keep_cell_types <- apply(data_obj_use$fpkm_for_clust, 1, function(x) sum(abs(x) > 2, na.rm = TRUE) >=1 )
+data_obj_use$fpkm_for_clust <- data_obj_use$fpkm_for_clust[keep_cell_types,]
+# clean data : clean sample with no correlations
+useSamples <- !colSums(is.na(data_obj_use$fpkm_for_clust)) == nrow(data_obj_use$fpkm_for_clust)
+data_obj_use$fpkm_for_clust <- data_obj_use$fpkm_for_clust[,useSamples]
+# generate cell clusters
+data_obj_use <- cellClust(data_obj_use)
+```
+
+## Clean reference panel names
+```{r}
+useRow <- rownames(data_obj_use$fpkm_for_clust)
+  
+newRefAnnot <- data.frame(useRow, corrSum=rowSums(data_obj_use$fpkm_for_clust)) %>% 
+  dplyr::mutate(ord = dplyr::desc(corrSum)) %>% 
+  dplyr::arrange(ord) %>% 
+  dplyr::mutate(
+    cat = useRow,
+    cat = gsub("_", " ", cat),
+    cat = gsub("\\.+", " ", cat),
+    cat = gsub("([a-z])Cells", "\\1 Cells", cat, ignore.case = T),
+    cat = gsub("^(CD[0-9]+) (.+)", "\\2 \\1", cat, ignore.case = T),
+    cat = gsub("Leukemia([a-z])", "Leukemia \\1", cat),
+    cat = gsub("chronicMyelogenous", "chronic myelogenous", cat),
+    cat = gsub("Hi", " High", cat),
+    cat = gsub("Lo", " Low", cat),
+    cat = gsub(" sel$", "", cat),
+    cat = gsub("^X721 ", "", cat),
+    cat = gsub("K 562", "K562", cat),
+    cat = gsub("Tcell", "T cell", cat, ignore.case = T),
+    cat = gsub("BCell", "T cell", cat, ignore.case = T),
+    cat = gsub("NKCell", "NK cell", cat, ignore.case = T),
+    cat = gsub("cells", "Cell", cat, ignore.case = T),
+    cat = gsub("dentritic", "Dendritic", cat, ignore.case = T),
+    cat = gsub("  ", " ", cat),
+    cat = gsub("^ ", "", cat),
+    cat = gsub(" $", "", cat),
+    catUnique = gsub("^L[0-9]+ ", "", cat)
+    ) %>% 
+  tibble::column_to_rownames(var = 'useRow')
+
+data_obj_use$fpkm_for_clust <- data_obj_use$fpkm_for_clust[rownames(newRefAnnot),]
+rownames(data_obj_use$fpkm_for_clust) <- newRefAnnot$cat
+```
+
+## Remove duplicated references from the panel
+
+Some cell types for references are duplicated. For example 'L82 T Cell CD8' == 'L78 T Cell CD8'. For duplicated cell types, select the ones with the highest correlation in case samples
+
+```{r}
+useSamples <- colnames(data_obj_use$fpkm)
+case.samples <- ! colData(useSce) %>% data.frame %>% 
+  dplyr::filter(sample %in% useSamples) %>% 
+  collect %>% .[["is.ref"]]
+newRefAnnot$corrSum <- rowSums(data_obj_use$fpkm_for_clust[,case.samples])
+newRefAnnot <- newRefAnnot[order(newRefAnnot$corrSum, decreasing = T),]
+keepUnique <- !duplicated(newRefAnnot$catUnique)
+newRefAnnot <- newRefAnnot[keepUnique, ]
+data_obj_use$fpkm_for_clust <- data_obj_use$fpkm_for_clust[newRefAnnot$cat,]
+rownames(data_obj_use$fpkm_for_clust) <- newRefAnnot$catUnique
+
+```
+
+## Remove non immune references
+
+```{r}
+immune.patterns <- c('dendritic', 'dentritic', 'marrow', 'monocyte', 'b cell', 't cell', 
+                       'myeloid', 'nk', 'lymph', 'cd34', 'erythroid', 
+                       'myelocyte', 'macrophage', 'neutrophil', 'erythroblast', 'lymphoblasts')
+remove.quasi.immune.patterns <- c('lymphoma')
+use.ref.names <- rownames(data_obj_use$fpkm_for_clust)
+keep.ref.names <- grepl(
+  paste(immune.patterns, collapse="|"), 
+  use.ref.names, 
+  ignore.case = TRUE)
+keep.quasiref.names <- !grepl(
+  paste(remove.quasi.immune.patterns, collapse="|"), 
+  use.ref.names, 
+  ignore.case = TRUE)
+cat("The following reference samples have been removed from the final list because they were not considered immune cell types:\n\n")
+cat(paste(paste("* ", use.ref.names[!keep.ref.names | !keep.quasiref.names], " "), collapse = "\n\n"), "\n\n")
+cat("\n\n")
+
+data_obj_use$fpkm_for_clust <- data_obj_use$fpkm_for_clust[keep.ref.names,]
+```
+
+
+
+# Figures
+## Fig.1d : RCA clustering and heatmap
+
+Reference component analysis clustering of CTC-associated WBCs and reference (ref.) WBCs from patients with breast cancer, displaying projection scores of cells (columns; n = 50) on the immune reference panel (rows)
+
+```{r, fig.height=13, fig.width=15}
+# Define annotation and colors for the heatmap
+annot <- colData(useSce[,colnames(data_obj_use$fpkm_for_clust)]) %>% data.frame %>% 
+  dplyr::select(sample_cell_cat) %>%
+  tibble::rownames_to_column(var = "rownames") %>%
+  dplyr::filter(rownames %in% colnames(data_obj_use$fpkm_for_clust)) %>%
+  dplyr::mutate(
+    sample_cell_cat = plyr::revalue(sample_cell_cat, c(
+                              "CTC.wbc" = "CTC-cluster-derived WBC",
+                              "REF.NKcells" = "REF. NK cells",
+                              "REF.Tcells" = "REF. T cells",
+                              "REF.Bcells" = "REF. B cells",
+                              "REF.Monocytes" = "REF. Monocyte",
+                              "REF.Granulocytes" = "REF. Granulocyte")
+                              ) %>% 
+      droplevels
+    ) %>% 
+  dplyr::arrange(sample_cell_cat) %>%
+  dplyr::rename(Category = sample_cell_cat) %>% 
+  tibble::column_to_rownames(var = "rownames")
+
+# Palette colors for samples/columns annotation
+color2WBC <- '#EC352F' # color picked for WBC 
+pal <- pal_npg("nrc", alpha = 0.8)(9)[c(2,3,4,6)]
+palette_sampleCat <- c(color2WBC, 
+                        colorRampPalette(pal)(nlevels(annot$Category)-1)
+                        )
+
+# Define clusters
+clusterGroups <- factor(data_obj_use$group_labels_color[colnames(data_obj_use$fpkm_for_clust), "groupLabel"])
+names(clusterGroups) <- colnames(data_obj_use$fpkm_for_clust)
+
+# Palette list 
+paletteList  <- list(
+  sampleCat = add.alpha(palette_sampleCat, .8)
+)
+  
+# Create heatmap with correlations
+use.heatCol <- heatCol.gen(data_obj_use$fpkm_for_clust, 
+                            center = TRUE, 
+                            pal = 'RdBu', 
+                            reverse.pal = TRUE)
+    
+useAnno <- annot[colnames(data_obj_use$fpkm_for_clust),,drop=FALSE]
+ 
+annotation_legend_param = list(chr = list(nrow = 2, title = "chr", title_position = "leftcenter"))
+
+
+hp <- createHeatMap(
+  data_obj_use$fpkm_for_clust, 
+  annot = useAnno, 
+  usePaletteList = paletteList,
+  show_row_names = T,
+  show_column_names = F,
+  colCluster = T,
+  rowCluster = T,
+  show_row_dend = F,
+  show_column_dend = F,
+  multipalette = F,
+  resCluster = F,
+  column_names_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 16),
+  row_names_max_width = unit(9, "cm"),
+  top_annotation_height = unit(1.5, "cm"), 
+  column_dend_gp = gpar(lty = 2), 
+  range = range(data_obj_use$fpkm_for_clust),
+  dendC = data_obj_use$cellTree,
+  heatCol = use.heatCol,
+  heatmap_legend_param = list(color_bar = "continuous",
+                              labels_gp = gpar(fontsize = 20),
+                              legend_direction = "horizontal",
+                              grid_height = unit(10, "mm"), 
+                              legend_width = unit(80, "mm"),
+                              title_position = "topcenter",
+                              title_gp = gpar(fontsize = 20, fontface = 'bold')),
+  annotation_legend_param = list(Category = list( 
+                                  labels_gp = gpar(fontsize = 20, fontface = 'bold'),
+                                  grid_height = unit(8, "mm"),
+                                  grid_width = unit(8, "mm"),
+                                  title = "",
+                                  nrow = 3)),
+  name = "(Projection score)"
+  )
+
+
+
+# Output
+draw(hp, heatmap_legend_side = "bottom", annotation_legend_side = "top")
+cat("\n\n")
+
+  
+```
+
+
+
+## Extended Data Fig.2b : PCA
+
+Principal component analysis (PCA) of CTC-associated WBCs of patients and five reference WBC populations (n = 50)
+```{r, fig.height=13, fig.width=15}
+
+pr <- prcomp(t(scale(data_obj_use$fpkm_for_clust)))
+
+pct_variance <- round(100*(pr$sdev ^ 2) / sum(pr$sdev^2) , 1)
+pc_projection <- as.data.frame(pr$x)
+pc_projection <- cbind(pc_projection, useAnno[rownames(pr$x),,drop = FALSE]) %>% 
+  dplyr::mutate(
+    is.ref = ifelse(grepl('REF', Category), 'reference WBC', 'CTC-cluster-derived WBC'),
+    Category = Category %>% droplevels
+    )
+
+use.colors <- add.alpha(palette_sampleCat, 0.5)
+names(use.colors) <- NULL
+
+pca_plot <- ggplot(pc_projection, aes(x = PC1, y = PC2, color = Category, shape = is.ref)) +
+  geom_point(size = 10) +
+  scale_color_manual(values=use.colors) +
+  labs(x = "PC1",
+       y = "PC2") +
+  theme(axis.text.x = element_text(size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title = element_text(size = 24),
+        legend.text = element_text(size = 18),
+        legend.position="top") + 
+  guides(col = guide_legend(ncol = 3, byrow = TRUE, title = NULL),
+         shape = guide_legend(ncol = 1, title = NULL))
+
+
+  
+print(pca_plot)
+cat("\n\n")
+```
+
+
+
+# Save results for other analyses
+```{r}
+rca <- list()
+rca$data <- data_obj_use
+rca$cellClust <- clusterGroups
+saveRDS(rca, file = file.path(dir.res, "rca_hsa.rds"))
+```
+
+
+

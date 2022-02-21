@@ -9,7 +9,7 @@ The code below shows how to download the data and prepare the files in order to 
 
 1.  Clone this repository
 ```{bash}
-git clone https://github.com/CMETlab/ctc-wbc.git
+git clone https://github.com/TheAcetoLab/ctc-wbc.git
 ```
 2. Download `SingleCellExperiment` deposited on GEO
 This can be done by changing your working directory to the one containing the repository and running `./download_data.sh`
